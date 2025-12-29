@@ -267,6 +267,62 @@ class DataStorage:
 
         return True
 
+    async def get_day_row_counts(self, symbol: str, day_start: int) -> dict[str, int]:
+        """Return row counts for key aggregates for a given day."""
+        if not self._db:
+            raise RuntimeError("Database not initialized")
+
+        symbol = symbol.upper()
+        day_end = int(day_start) + 86_400_000
+
+        async with self._lock:
+            cur = await self._db.execute(
+                """
+                SELECT COUNT(*) FROM footprint_1m
+                WHERE symbol = ? AND timestamp >= ? AND timestamp < ?
+                """,
+                (symbol, int(day_start), day_end),
+            )
+            fp_count = int((await cur.fetchone() or (0,))[0])
+            await cur.close()
+
+            cur = await self._db.execute(
+                """
+                SELECT COUNT(*) FROM daily_trades
+                WHERE symbol = ? AND date = ?
+                """,
+                (symbol, int(day_start)),
+            )
+            dt_count = int((await cur.fetchone() or (0,))[0])
+            await cur.close()
+
+            cur = await self._db.execute(
+                """
+                SELECT COUNT(*) FROM vwap_data
+                WHERE symbol = ? AND date = ?
+                """,
+                (symbol, int(day_start)),
+            )
+            vwap_count = int((await cur.fetchone() or (0,))[0])
+            await cur.close()
+
+            cur = await self._db.execute(
+                """
+                SELECT COUNT(*) FROM session_levels
+                WHERE symbol = ? AND date = ?
+                """,
+                (symbol, int(day_start)),
+            )
+            session_count = int((await cur.fetchone() or (0,))[0])
+            await cur.close()
+
+        return {
+            "footprint_1m": fp_count,
+            "daily_trades": dt_count,
+            "vwap_data": vwap_count,
+            "session_levels": session_count,
+        }
+
     async def get_day_cvd(self, symbol: str, day_start: int) -> float:
         """Get cumulative volume delta (CVD) for a given day from persisted aggregates.
 

@@ -411,6 +411,8 @@ class AggTradesBackfiller:
 
         # Backfill day by day (keeps ranges small and makes "missing days" logic easy)
         capped = False
+        max_empty_retries = max(0, int(self.settings.backfill_empty_day_retries))
+        retry_delay_ms = max(0, int(self.settings.backfill_empty_day_retry_delay_ms))
         for day_start in days_to_backfill:
             if capped:
                 break
@@ -420,129 +422,91 @@ class AggTradesBackfiller:
             if day_range_end <= day_range_start:
                 continue
 
-            # Prefer Binance Vision for completed (past) UTC days.
-            # This avoids hammering `/fapi/v1/aggTrades` and triggering 429 rate limits.
-            use_vision = (
-                self.vision is not None
-                and self.settings.backfill_source in ("auto", "vision")
-                and (day_start + ms_in_day) <= today_start_ms
-            )
-            if use_vision:
-                if max_requests is not None and requests_made >= max_requests:
-                    self.logger.warning(
-                        "backfill_request_cap_hit",
-                        symbol=symbol,
-                        requests_made=requests_made,
-                        max_requests=max_requests,
-                    )
-                    capped = True
-                    break
+            day_date = datetime.fromtimestamp(day_start / 1000.0, tz=timezone.utc).date()
 
-                day_date = datetime.fromtimestamp(day_start / 1000.0, tz=timezone.utc).date()
-                self.logger.info(
-                    "backfill_day_vision_start",
-                    symbol=symbol,
-                    day=str(day_date),
-                    range_start=day_range_start,
-                    range_end=day_range_end,
+            async def backfill_day_once() -> None:
+                nonlocal capped, requests_made, trades_fetched, last_processed_id
+
+                # Prefer Binance Vision for completed (past) UTC days.
+                # This avoids hammering `/fapi/v1/aggTrades` and triggering 429 rate limits.
+                use_vision = (
+                    self.vision is not None
+                    and self.settings.backfill_source in ("auto", "vision")
+                    and (day_start + ms_in_day) <= today_start_ms
                 )
-                vision_ok = False
-                try:
-                    batch: list[AggTrade] = []
-                    async for tr in self.vision.iter_daily_aggtrades(
+                if use_vision:
+                    if max_requests is not None and requests_made >= max_requests:
+                        self.logger.warning(
+                            "backfill_request_cap_hit",
+                            symbol=symbol,
+                            requests_made=requests_made,
+                            max_requests=max_requests,
+                        )
+                        capped = True
+                        return
+
+                    self.logger.info(
+                        "backfill_day_vision_start",
                         symbol=symbol,
-                        day=day_date,
-                        start_ms=day_range_start,
-                        end_ms=day_range_end,
-                    ):
-                        batch.append(tr)
-                        if len(batch) >= 5000:
+                        day=str(day_date),
+                        range_start=day_range_start,
+                        range_end=day_range_end,
+                    )
+                    vision_ok = False
+                    try:
+                        batch: list[AggTrade] = []
+                        async for tr in self.vision.iter_daily_aggtrades(
+                            symbol=symbol,
+                            day=day_date,
+                            start_ms=day_range_start,
+                            end_ms=day_range_end,
+                        ):
+                            batch.append(tr)
+                            if len(batch) >= 5000:
+                                _process_page(batch, day_range_end)
+                                batch.clear()
+
+                                if len(fp) >= FLUSH_KEYS or len(dt) >= FLUSH_KEYS:
+                                    await flush()
+
+                                # Yield control so the event loop stays responsive
+                                await asyncio.sleep(0)
+
+                        if batch:
                             _process_page(batch, day_range_end)
                             batch.clear()
 
-                            if len(fp) >= FLUSH_KEYS or len(dt) >= FLUSH_KEYS:
-                                await flush()
+                        # Final flush for this day
+                        await flush()
+                        vision_ok = True
+                    except Exception as e:
+                        self.logger.warning(
+                            "backfill_day_vision_failed",
+                            symbol=symbol,
+                            day=str(day_date),
+                            error=str(e),
+                        )
 
-                            # Yield control so the event loop stays responsive
-                            await asyncio.sleep(0)
+                    # Count the Vision fetch attempt as a single request for stats/capping purposes.
+                    requests_made += 1
 
-                    if batch:
-                        _process_page(batch, day_range_end)
-                        batch.clear()
+                    if vision_ok:
+                        self.logger.info(
+                            "backfill_day_vision_done",
+                            symbol=symbol,
+                            day=str(day_date),
+                        )
+                        return
 
-                    # Final flush for this day
-                    await flush()
-                    vision_ok = True
-                except Exception as e:
-                    self.logger.warning(
-                        "backfill_day_vision_failed",
-                        symbol=symbol,
-                        day=str(day_date),
-                        error=str(e),
-                    )
-
-                # Count the Vision fetch attempt as a single request for stats/capping purposes.
-                requests_made += 1
-
-                if vision_ok:
+                    # If Vision is configured but unavailable for this day, fall back to REST.
                     self.logger.info(
-                        "backfill_day_vision_done",
+                        "backfill_day_vision_fallback_to_rest",
                         symbol=symbol,
                         day=str(day_date),
                     )
-                    continue
 
-                # If Vision is configured but unavailable for this day, fall back to REST.
-                self.logger.info(
-                    "backfill_day_vision_fallback_to_rest",
-                    symbol=symbol,
-                    day=str(day_date),
-                )
-
-            chunk_start = day_range_start
-            while chunk_start < day_range_end:
-                if max_requests is not None and requests_made >= max_requests:
-                    self.logger.warning(
-                        "backfill_request_cap_hit",
-                        symbol=symbol,
-                        requests_made=requests_made,
-                        max_requests=max_requests,
-                    )
-                    capped = True
-                    break
-
-                chunk_end = min(day_range_end, chunk_start + chunk_ms)
-
-                # First page for this chunk uses startTime+endTime (<=60 min)
-                trades = await self.rest.get_agg_trades(
-                    symbol=symbol,
-                    start_time=chunk_start,
-                    end_time=chunk_end,
-                    limit=1000,
-                )
-                requests_made += 1
-
-                processed_any, boundary_reached = _process_page(trades, chunk_end)
-
-                # Periodic flush
-                if len(fp) >= FLUSH_KEYS or len(dt) >= FLUSH_KEYS:
-                    await flush()
-
-                if pause_ms > 0:
-                    await asyncio.sleep(pause_ms / 1000.0)
-
-                # If the initial page already crossed the boundary (or had no trades), stop paging.
-                if not trades or boundary_reached or not processed_any:
-                    chunk_start = chunk_end
-                    continue
-
-                # If less than the limit returned, we're done for this chunk.
-                if len(trades) < 1000:
-                    chunk_start = chunk_end
-                    continue
-
-                # There may be more trades within the chunk; continue paging via fromId only.
-                while True:
+                chunk_start = day_range_start
+                while chunk_start < day_range_end:
                     if max_requests is not None and requests_made >= max_requests:
                         self.logger.warning(
                             "backfill_request_cap_hit",
@@ -553,32 +517,124 @@ class AggTradesBackfiller:
                         capped = True
                         break
 
-                    if last_processed_id is None:
-                        break
+                    chunk_end = min(day_range_end, chunk_start + chunk_ms)
 
-                    next_from_id = last_processed_id + 1
-                    page = await self.rest.get_agg_trades(
+                    # First page for this chunk uses startTime+endTime (<=60 min)
+                    trades = await self.rest.get_agg_trades(
                         symbol=symbol,
-                        from_id=next_from_id,
+                        start_time=chunk_start,
+                        end_time=chunk_end,
                         limit=1000,
                     )
                     requests_made += 1
 
-                    processed_any2, boundary_reached2 = _process_page(page, chunk_end)
+                    processed_any, boundary_reached = _process_page(trades, chunk_end)
 
+                    # Periodic flush
                     if len(fp) >= FLUSH_KEYS or len(dt) >= FLUSH_KEYS:
                         await flush()
 
                     if pause_ms > 0:
                         await asyncio.sleep(pause_ms / 1000.0)
 
-                    if not page or boundary_reached2 or not processed_any2:
-                        break
+                    # If the initial page already crossed the boundary (or had no trades), stop paging.
+                    if not trades or boundary_reached or not processed_any:
+                        chunk_start = chunk_end
+                        continue
 
-                    if len(page) < 1000:
-                        break
+                    # If less than the limit returned, we're done for this chunk.
+                    if len(trades) < 1000:
+                        chunk_start = chunk_end
+                        continue
 
-                chunk_start = chunk_end
+                    # There may be more trades within the chunk; continue paging via fromId only.
+                    while True:
+                        if max_requests is not None and requests_made >= max_requests:
+                            self.logger.warning(
+                                "backfill_request_cap_hit",
+                                symbol=symbol,
+                                requests_made=requests_made,
+                                max_requests=max_requests,
+                            )
+                            capped = True
+                            break
+
+                        if last_processed_id is None:
+                            break
+
+                        next_from_id = last_processed_id + 1
+                        page = await self.rest.get_agg_trades(
+                            symbol=symbol,
+                            from_id=next_from_id,
+                            limit=1000,
+                        )
+                        requests_made += 1
+
+                        processed_any2, boundary_reached2 = _process_page(page, chunk_end)
+
+                        if len(fp) >= FLUSH_KEYS or len(dt) >= FLUSH_KEYS:
+                            await flush()
+
+                        if pause_ms > 0:
+                            await asyncio.sleep(pause_ms / 1000.0)
+
+                        if not page or boundary_reached2 or not processed_any2:
+                            break
+
+                        if len(page) < 1000:
+                            break
+
+                    chunk_start = chunk_end
+
+                await flush()
+
+            retries_left = max_empty_retries
+            attempt = 0
+            while True:
+                attempt += 1
+                last_processed_id = None
+                if attempt > 1:
+                    await self.storage.clear_day(symbol, day_start)
+
+                await backfill_day_once()
+
+                if capped:
+                    break
+
+                counts = await self.storage.get_day_row_counts(symbol, day_start)
+                if sum(counts.values()) > 0:
+                    break
+
+                if retries_left > 0:
+                    self.logger.warning(
+                        "backfill_day_empty_retry",
+                        code="BACKFILL_ZERO_ROWS",
+                        symbol=symbol,
+                        day=str(day_date),
+                        attempt=attempt,
+                        remaining=retries_left,
+                    )
+                    retries_left -= 1
+                    if retry_delay_ms > 0:
+                        await asyncio.sleep(retry_delay_ms / 1000.0)
+                    continue
+
+                failure_code = "BACKFILL_ZERO_ROWS"
+                self.logger.error(
+                    "backfill_day_zero_rows",
+                    code=failure_code,
+                    symbol=symbol,
+                    day=str(day_date),
+                    attempts=attempt,
+                    range_start=day_range_start,
+                    range_end=day_range_end,
+                )
+                raise RuntimeError(
+                    f"{failure_code}: no stored rows for {symbol} on {day_date} after {attempt} attempts"
+                )
+
+            if capped:
+                break
 
         # Final flush
         await flush()
