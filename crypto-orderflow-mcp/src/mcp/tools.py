@@ -1220,6 +1220,7 @@ class MCPTools:
             if s.end_minutes <= s.start_minutes:
                 end_ms += 86_400_000  # crosses midnight
 
+        warnings: list[str] = []
         status = "completed"
         effective_end = end_ms
         if is_today:
@@ -1241,7 +1242,19 @@ class MCPTools:
         if tick_size is None:
             # TPO profiles typically use a much coarser price step than footprints.
             # Use the dedicated TPO tick size defaults from env.
-            tick_size = self.settings.get_tpo_tick_size(symbol)
+            try:
+                tick_size = self.settings.get_tpo_tick_size(symbol)
+            except Exception as e:
+                tick_size = self.settings.get_default_tpo_tick_size(symbol)
+                warnings.append(
+                    f"TPO tick size not configured for {symbol}; using default {tick_size}."
+                )
+                self.logger.warning(
+                    "tpo_tick_size_default_used",
+                    symbol=symbol,
+                    tickSize=tick_size,
+                    error=str(e),
+                )
 
         # Build TPO profile from footprint (up to effective_end for developing sessions)
         tpo_profile = await self.tpo_profile.build_profile(
@@ -1343,7 +1356,6 @@ class MCPTools:
             ib_high = max(k.high for k in ib_slice)
             ib_low = min(k.low for k in ib_slice)
 
-        warnings: list[str] = []
         if tpo_profile.get("totals", {}).get("tpoTotalCount", 0) == 0:
             warnings.append(
                 "No local footprint data found for this window. Run backfill or wait for live collection."
