@@ -779,7 +779,8 @@ class MCPTools:
             end_time: End timestamp in milliseconds
         
         Returns:
-            Orderflow metrics with delta sequence, CVD, imbalances
+            Orderflow metrics with delta sequence, CVD, imbalances. The
+            ``currentCVD`` field reflects the last value of ``cvdSequence``.
         """
         symbol = symbol.upper()
         self.logger.info("get_orderflow_metrics", symbol=symbol, timeframe=timeframe)
@@ -791,6 +792,8 @@ class MCPTools:
             start_time=start_time,
             end_time=end_time,
         )
+        cvd_sequence = delta_data.get("cvdSequence", [])
+        current_cvd = cvd_sequence[-1]["cvd"] if cvd_sequence else delta_data.get("currentCVD", 0)
         
         # Get footprint bars for imbalance analysis
         footprint_bars = await self.footprint.get_footprint_range(
@@ -832,8 +835,8 @@ class MCPTools:
             "timestamp": timestamp_ms(),
             "delta": delta_data.get("summary", {}),
             "deltaSequence": delta_data.get("deltaSequence", []),
-            "cvdSequence": delta_data.get("cvdSequence", []),
-            "currentCVD": delta_data.get("currentCVD", 0),
+            "cvdSequence": cvd_sequence,
+            "currentCVD": current_cvd,
             "imbalances": imbalance_analysis,
             "volumeUnit": symbol.replace("USDT", ""),
         }
