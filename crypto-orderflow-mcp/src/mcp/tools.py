@@ -60,6 +60,56 @@ class MCPTools:
         self.depth_delta = depth_delta
         self.heatmap = heatmap
         self.logger = get_logger("mcp.tools")
+
+    def _get_tpo_tick_size_safe(self, symbol: str) -> float:
+        """Get TPO tick size with fallbacks for missing settings fields."""
+        symbol = symbol.upper()
+
+        has_helper = hasattr(self.settings, "get_tpo_tick_size")
+        has_btc_tick = hasattr(self.settings, "tpo_tick_size_btc")
+        has_eth_tick = hasattr(self.settings, "tpo_tick_size_eth")
+
+        # If the specialized tick sizes are missing, fall back to conservative defaults.
+        fallback_map = {
+            "BTC": 70.0,
+            "ETH": 5.0,
+        }
+
+        # Prefer the configured helper when available and relevant fields exist.
+        if has_helper and ((has_btc_tick and "BTC" in symbol) or (has_eth_tick and "ETH" in symbol)):
+            try:
+                return float(self.settings.get_tpo_tick_size(symbol))
+            except Exception as exc:  # pragma: no cover - defensive logging
+                self.logger.warning(
+                    "tpo_tick_size_helper_failed",
+                    symbol=symbol,
+                    error=str(exc),
+                )
+
+        # Use hardcoded defaults when symbol matches and fields are missing.
+        for key, default_value in fallback_map.items():
+            if key in symbol and not (has_btc_tick if key == "BTC" else has_eth_tick):
+                self.logger.warning(
+                    "tpo_tick_size_fallback_used",
+                    symbol=symbol,
+                    fallback=default_value,
+                    reason="missing_settings_field",
+                )
+                return default_value
+
+        # As a last resort, try the helper even if the expected fields are absent; it guards internally.
+        if has_helper:
+            return float(self.settings.get_tpo_tick_size(symbol))
+
+        # Ultimate safety net: choose ETH default for alts and BTC for everything else.
+        default_value = fallback_map["BTC"] if "BTC" in symbol else fallback_map["ETH"]
+        self.logger.warning(
+            "tpo_tick_size_fallback_used",
+            symbol=symbol,
+            fallback=default_value,
+            reason="missing_helper",
+        )
+        return default_value
     
     async def get_market_snapshot(self, symbol: str) -> dict[str, Any]:
         """Get market snapshot including price, funding, OI.
@@ -1244,7 +1294,7 @@ class MCPTools:
         if tick_size is None:
             # TPO profiles typically use a much coarser price step than footprints.
             # Use the dedicated TPO tick size defaults from env.
-            tick_size = self.settings.get_tpo_tick_size(symbol)
+            tick_size = self._get_tpo_tick_size_safe(symbol)
 
         # Build TPO profile from footprint (up to effective_end for developing sessions)
         tpo_profile = await self.tpo_profile.build_profile(
