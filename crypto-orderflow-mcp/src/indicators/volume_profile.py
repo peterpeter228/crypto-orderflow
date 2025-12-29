@@ -6,7 +6,7 @@ from collections import defaultdict
 from src.data.storage import DataStorage
 from src.config import get_settings
 from src.utils import get_logger, timestamp_ms, round_to_tick
-from src.utils.helpers import get_day_start_ms, get_yesterday_range_ms
+from src.utils.helpers import get_day_start_ms
 
 # Milliseconds in one day (UTC)
 MS_IN_DAY = 86_400_000
@@ -20,12 +20,12 @@ class VolumeProfileCalculator:
         self.settings = get_settings()
         self.logger = get_logger("indicators.volume_profile")
         
-        # In-memory *quote* volume (synthetic: price*qty, USDT) by price level for current day.
+        # In-memory *base* volume by price level for the current UTC day.
         #
         # IMPORTANT: this must be tied to a specific UTC day. Without tracking the
         # day, a long-running server would keep accumulating volume across day
         # boundaries, causing dPOC/dVAH/dVAL to drift.
-        self._profiles: dict[str, dict[float, float]] = {}  # symbol -> {price_level -> quote_volume_usdt}
+        self._profiles: dict[str, dict[float, float]] = {}  # symbol -> {price_level -> base_volume}
         self._profile_day: dict[str, int] = {}  # symbol -> day_start_ms (UTC)
     
     async def update(
@@ -58,10 +58,10 @@ class VolumeProfileCalculator:
             self._profiles[symbol] = defaultdict(float)
             self._profile_day[symbol] = date
         
-        # Use synthetic/quote volume (USDT) so POC/VA matches most orderflow platforms
-        notional = price * volume
+        # Track base volume for profile statistics (closer to exchange-reported volume/POC).
+        base_volume = float(volume)
 
-        self._profiles[symbol][price_level] += notional
+        self._profiles[symbol][price_level] += base_volume
         
         # Persist to storage
         await self.storage.upsert_daily_trade(
@@ -71,7 +71,7 @@ class VolumeProfileCalculator:
             volume=volume,
             buy_volume=buy_volume,
             sell_volume=sell_volume,
-            notional=notional,
+            notional=price * volume,
         )
     
     def calculate_poc(self, profile: dict[float, float], mid_price: float | None = None) -> float | None:
@@ -177,15 +177,10 @@ class VolumeProfileCalculator:
         val = sorted_prices[val_idx]
         return poc, vah, val
 
-    def build_quote_profile(self, rows: list[dict[str, Any]]) -> dict[float, float]:
-        """Build a *quote-denominated* (USDT) volume profile from storage rows.
+    def build_volume_profile(self, rows: list[dict[str, Any]]) -> dict[float, float]:
+        """Build a base-volume profile from storage rows.
 
-        The storage layer returns volumes in base units (e.g. BTC).
-        Exocharts (and many orderflow platforms) often display *synthetic* volume
-        as `base_volume * price` for linear contracts. We therefore convert each
-        price-level's volume into quote (USDT) and aggregate by price level.
-
-        Expected row keys: price_level, buy_volume, sell_volume, total_volume.
+        Expected row keys: price_level, buy_volume, sell_volume, total_volume or volume.
         """
         profile: dict[float, float] = {}
         for r in rows:
@@ -196,18 +191,17 @@ class VolumeProfileCalculator:
 
             buy_v = float(r.get("buy_volume") or 0.0)
             sell_v = float(r.get("sell_volume") or 0.0)
-            total_v = float(r.get("total_volume") or 0.0)
+            total_v = float(r.get("total_volume") or r.get("volume") or 0.0)
 
-            # Prefer buy+sell if provided, otherwise fall back to total_volume.
+            # Prefer buy+sell if provided, otherwise fall back to total/volume.
             base_v = buy_v + sell_v
             if base_v <= 0 and total_v > 0:
                 base_v = total_v
 
-            quote_v = base_v * price
-            if quote_v == 0:
+            if base_v == 0:
                 continue
 
-            profile[price] = float(profile.get(price, 0.0) + quote_v)
+            profile[price] = float(profile.get(price, 0.0) + base_v)
         return profile
     
     async def get_today_profile(self, symbol: str) -> dict[float, float]:
@@ -229,7 +223,12 @@ class VolumeProfileCalculator:
             if rows:
                 profile = defaultdict(float)
                 for row in rows:
-                    profile[row["price_level"]] = row["notional"]
+                    base_v = float(row.get("buy_volume") or 0.0) + float(row.get("sell_volume") or 0.0)
+                    if base_v <= 0:
+                        base_v = float(row.get("volume") or 0.0)
+                    if base_v <= 0:
+                        continue
+                    profile[row["price_level"]] = base_v
 
                 # Keep cache in sync
                 self._profiles[symbol] = profile
@@ -263,20 +262,25 @@ class VolumeProfileCalculator:
         yesterday_start = get_day_start_ms(timestamp_ms()) - MS_IN_DAY
         yesterday_end = yesterday_start + MS_IN_DAY
 
-        # 1) Preferred: footprint-derived profile (synthetic/quote volume)
+        # 1) Preferred: footprint-derived profile (base volume)
         try:
             rows = await self.storage.get_profile_range(symbol, yesterday_start, yesterday_end)
             if rows:
-                return self.build_quote_profile(rows)
+                return self.build_volume_profile(rows)
         except Exception:
             # Fall back to daily_trades below.
             pass
 
-        # 2) Fallback: daily_trades-derived profile (also quote/notional)
+        # 2) Fallback: daily_trades-derived profile (base volume)
         rows = await self.storage.get_daily_trades(symbol, yesterday_start)
         profile: dict[float, float] = {}
         for row in rows:
-            profile[row["price_level"]] = float(row.get("notional", 0.0))
+            base_v = float(row.get("buy_volume") or 0.0) + float(row.get("sell_volume") or 0.0)
+            if base_v <= 0:
+                base_v = float(row.get("volume") or 0.0)
+            if base_v <= 0:
+                continue
+            profile[row["price_level"]] = base_v
         return profile
     
     async def get_key_levels(self, symbol: str, date: int | None = None) -> dict[str, Any]:
@@ -301,32 +305,17 @@ class VolumeProfileCalculator:
         dev_end = now_ms if is_current_day else day_end
         prev_day_start = day_start - MS_IN_DAY
 
-        async def _load_profile(start_ms: int, end_ms: int, *, fallback_day: int | None = None) -> dict[float, float]:
+        async def _load_profile(start_ms: int, end_ms: int, fallback_day: int | None = None) -> dict[float, float]:
             try:
                 rows = await self.storage.get_profile_range(symbol, start_ms, end_ms)
-                if rows:
-                    return self.build_quote_profile(rows)
+                profile = self.build_volume_profile(rows)
+                if profile:
+                    return profile
 
-                coverage = await self.storage.get_footprint_coverage(symbol, start_ms, end_ms)
-                minute_buckets = int(coverage.get("minuteBuckets") or coverage.get("minute_buckets") or 0)
-                if minute_buckets == 0 and fallback_day is not None:
-                    self.logger.warning(
-                        "volume_profile_footprint_missing_fallback_daily",
-                        symbol=symbol,
-                        fallback_day=fallback_day,
-                        start_ms=start_ms,
-                        end_ms=end_ms,
-                    )
+                # Fallback: if we queried a full UTC day and footprint is empty, reuse daily snapshot.
+                if fallback_day is not None:
                     daily_rows = await self.storage.get_daily_trades(symbol, fallback_day)
-                    if daily_rows:
-                        profile = {
-                            row["price_level"]: float(row.get("notional", 0.0))
-                            for row in daily_rows
-                            if row.get("price_level") is not None
-                        }
-                        return profile
-
-                return {}
+                    return self.build_volume_profile(daily_rows)
             except Exception as e:
                 self.logger.warning(
                     "volume_profile_storage_read_failed",
@@ -337,7 +326,7 @@ class VolumeProfileCalculator:
                 )
                 return {}
 
-        # Profiles (quote-denominated)
+        # Profiles (base-volume)
         today_profile = await _load_profile(day_start, dev_end, fallback_day=day_start)
         d_poc, d_vah, d_val = self.calculate_value_area(today_profile)
 
