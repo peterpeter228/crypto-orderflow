@@ -255,6 +255,16 @@ class Settings(BaseSettings):
     # endpoint at full speed. A small pause also helps keep the server responsive on boot.
     backfill_request_pause_ms: int = Field(default=250)
 
+    # Retry a day when REST returns zero rows.
+    backfill_empty_day_retries: int = Field(
+        default=2,
+        description="Number of retries when a backfilled day ends up with zero stored rows.",
+    )
+    backfill_empty_day_retry_delay_ms: int = Field(
+        default=500,
+        description="Delay between retries for empty backfill days (milliseconds).",
+    )
+
     # (heatmap settings declared above under Orderbook Configuration)
     
     @property
