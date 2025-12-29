@@ -306,7 +306,11 @@ class Settings(BaseSettings):
             return float(self.footprint_tick_size_btc)
         if "ETH" in symbol:
             return float(self.footprint_tick_size_eth)
-        return float(self.footprint_tick_size_default)
+        # Fallback to a reasonable default if the legacy attribute is absent
+        # (older envs/configs may not define it).
+        if hasattr(self, "footprint_tick_size_default"):
+            return float(self.footprint_tick_size_default)
+        return 0.1
 
     def get_tpo_tick_size(self, symbol: str) -> float:
         """Get tick size for TPO profile aggregation based on symbol.
@@ -316,9 +320,12 @@ class Settings(BaseSettings):
         profiles are usually built on a much coarser price step.
         """
         symbol = symbol.upper()
-        if "BTC" in symbol:
+        has_btc_tick = hasattr(self, "tpo_tick_size_btc")
+        has_eth_tick = hasattr(self, "tpo_tick_size_eth")
+
+        if "BTC" in symbol and has_btc_tick:
             return float(self.tpo_tick_size_btc)
-        elif "ETH" in symbol:
+        elif "ETH" in symbol and has_eth_tick:
             return float(self.tpo_tick_size_eth)
 
         # Fallback: derive a reasonable coarse step from the symbol's native tick.
