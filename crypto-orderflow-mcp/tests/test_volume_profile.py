@@ -3,6 +3,7 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
+import src.indicators.volume_profile as volume_profile
 from src.indicators.volume_profile import (
     VolumeProfileCalculator,
     calculate_volume_profile,
@@ -146,10 +147,12 @@ class TestVolumeProfileCalculatorClass:
         return VolumeProfileCalculator(mock_storage)
     
     @pytest.mark.asyncio
-    async def test_update_accumulates_volume(self, calculator):
+    async def test_update_accumulates_volume(self, calculator, monkeypatch):
         """Test that update accumulates volume at price levels."""
         symbol = "BTCUSDT"
         timestamp = 1700000000000
+
+        monkeypatch.setattr(volume_profile, "timestamp_ms", lambda: timestamp)
         
         await calculator.update(symbol, 50000.0, 1.0, 0.6, 0.4, timestamp)
         await calculator.update(symbol, 50000.0, 0.5, 0.3, 0.2, timestamp)
@@ -157,7 +160,7 @@ class TestVolumeProfileCalculatorClass:
         profile = await calculator.get_today_profile(symbol)
         
         assert 50000.0 in profile
-        assert profile[50000.0] == 1.5  # 1.0 + 0.5
+        assert profile[50000.0] == 75000.0  # (1.0 + 0.5) * 50,000 notional
     
     def test_reset_day_clears_profile(self, calculator):
         """Test that reset_day clears the profile."""
@@ -168,3 +171,50 @@ class TestVolumeProfileCalculatorClass:
         
         assert symbol in calculator._profiles
         assert len(calculator._profiles[symbol]) == 0
+
+    @pytest.mark.asyncio
+    async def test_get_key_levels_previous_day_low_coverage_warns(self, mock_storage, monkeypatch):
+        """Low previous-day coverage should mark incomplete and emit warning."""
+        calculator = VolumeProfileCalculator(mock_storage)
+
+        now_ms = 1_700_000_000_000
+        day_start = volume_profile.get_day_start_ms(now_ms)
+        monkeypatch.setattr(volume_profile, "timestamp_ms", lambda: now_ms)
+
+        # Empty profiles; coverage data drives the warning.
+        mock_storage.get_profile_range = AsyncMock(side_effect=[[], []])
+        mock_storage.get_footprint_coverage = AsyncMock(
+            side_effect=[
+                {"minuteBuckets": 500, "minTs": None, "maxTs": None},  # developing (above 0.3)
+                {"minuteBuckets": 500, "minTs": None, "maxTs": None},  # previous day (below 0.9)
+            ]
+        )
+
+        result = await calculator.get_key_levels("BTCUSDT", date=day_start)
+
+        assert result["previousDay"]["complete"] is False
+        assert result["previousDay"]["provisional"] is True
+        assert any("Previous day profile incomplete" in w for w in result["warnings"])
+
+    @pytest.mark.asyncio
+    async def test_get_key_levels_developing_low_coverage_warns(self, mock_storage, monkeypatch):
+        """Developing coverage below threshold should be flagged as provisional."""
+        calculator = VolumeProfileCalculator(mock_storage)
+
+        # Six hours into the day -> expected minutes ~360
+        day_start = volume_profile.get_day_start_ms(1_700_000_000_000)
+        now_ms = day_start + 6 * 60 * 60 * 1000
+        monkeypatch.setattr(volume_profile, "timestamp_ms", lambda: now_ms)
+
+        mock_storage.get_profile_range = AsyncMock(side_effect=[[], []])
+        mock_storage.get_footprint_coverage = AsyncMock(
+            side_effect=[
+                {"minuteBuckets": 50, "minTs": None, "maxTs": None},   # developing (~13.9% < 30%)
+                {"minuteBuckets": 1440, "minTs": None, "maxTs": None},  # previous day full
+            ]
+        )
+
+        result = await calculator.get_key_levels("BTCUSDT", date=day_start)
+
+        assert result["developing"]["provisional"] is True
+        assert any("Developing profile coverage low" in w for w in result["warnings"])
