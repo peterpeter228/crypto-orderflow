@@ -19,6 +19,7 @@
   - VAH (Value Area High) - 价值区域上沿
   - VAL (Value Area Low) - 价值区域下沿
   - 支持当日开发中 (developing) 和前日 (previous day) 数据
+  - 使用 **base volume**（成交量）计算 POC/VA，若 footprint 覆盖不足会自动回退到日级快照，避免 previous* 全部返回 `null`
 - **Session High/Low**（默认主会话）:
   - 默认采用 Exocharts 常用的 4 段主会话（UTC）：
     - **A**: 00:00-06:00

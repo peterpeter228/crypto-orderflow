@@ -186,6 +186,15 @@ class Settings(BaseSettings):
     default_timeframe: str = Field(default="1m")
     footprint_tick_size_btc: float = Field(default=0.1)
     footprint_tick_size_eth: float = Field(default=0.01)
+    # TPO / Market Profile tick sizes (coarser than footprint ticks)
+    tpo_tick_size_btc: float = Field(
+        default=70.0,
+        description="Price bucket size for BTC TPO profiles (e.g., 70 = 70 USDT step)",
+    )
+    tpo_tick_size_eth: float = Field(
+        default=5.0,
+        description="Price bucket size for ETH TPO profiles (coarser than footprint ticks)",
+    )
     imbalance_ratio_threshold: float = Field(default=3.0)
     imbalance_consecutive_levels: int = Field(default=3)
     # TPO / Market Profile
