@@ -207,7 +207,7 @@
 
 ### get_orderflow_metrics
 
-获取 Orderflow 指标。
+获取 Orderflow 指标。`currentCVD` 字段等于返回的 `cvdSequence` 序列中的最后一个值。
 
 **参数：**
 | 名称 | 类型 | 必需 | 说明 |

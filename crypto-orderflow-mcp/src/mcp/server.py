@@ -174,7 +174,8 @@ def create_mcp_server(tools: MCPTools) -> tuple[FastAPI, None]:
             "name": "get_orderflow_metrics",
             "description": (
                 "Get orderflow metrics including delta bars, cumulative volume delta (CVD), "
-                "and stacked imbalance detection."
+                "and stacked imbalance detection. The returned currentCVD equals the last "
+                "cvdSequence value for the requested window."
             ),
             "inputSchema": {
                 "type": "object",
