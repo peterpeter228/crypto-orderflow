@@ -1,0 +1,44 @@
+[Unit]
+Description=Crypto Orderflow MCP Server
+After=network.target
+
+[Service]
+Type=simple
+User=mcp
+Group=mcp
+
+# ⚠️ Make sure this matches your install path
+WorkingDirectory=/opt/crypto-orderflow-mcp
+
+Environment=PYTHONPATH=/opt/crypto-orderflow-mcp
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=/opt/crypto-orderflow-mcp/.env
+
+# Start
+ExecStart=/opt/crypto-orderflow-mcp/.venv/bin/python /opt/crypto-orderflow-mcp/run.py
+
+# Auto restart
+Restart=always
+RestartSec=3
+
+# Graceful shutdown
+KillSignal=SIGINT
+TimeoutStopSec=20
+
+# Security / sandboxing (keep it practical for a VPS)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/crypto-orderflow-mcp/data
+
+# Resource limits (adjust as needed)
+LimitNOFILE=65535
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=crypto-orderflow-mcp
+
+[Install]
+WantedBy=multi-user.target

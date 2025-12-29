@@ -1,0 +1,66 @@
+version: '3.8'
+
+services:
+  crypto-orderflow-mcp:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: crypto-orderflow-mcp
+    restart: unless-stopped
+    ports:
+      - "8022:8022"
+    environment:
+      # Server Settings
+      - MCP_HOST=0.0.0.0
+      - MCP_PORT=8022
+      - LOG_LEVEL=INFO
+      - DEBUG=false
+      
+      # Binance API (using default public endpoints)
+      - BINANCE_REST_URL=https://fapi.binance.com
+      - BINANCE_WS_URL=wss://fstream.binance.com
+      
+      # Symbols to track
+      - SYMBOLS=BTCUSDT,ETHUSDT
+      
+      # Database (SQLite in container)
+      - CACHE_DB_PATH=/app/data/orderflow_cache.db
+      - DATA_RETENTION_DAYS=7
+      
+      # Session Times (UTC)
+      - TOKYO_SESSION=00:00-09:00
+      - LONDON_SESSION=07:00-16:00
+      - NY_SESSION=13:00-22:00
+      
+      # Orderflow Configuration
+      - FOOTPRINT_TICK_SIZE_BTC=0.1
+      - FOOTPRINT_TICK_SIZE_ETH=0.01
+      - IMBALANCE_RATIO_THRESHOLD=3.0
+      - IMBALANCE_CONSECUTIVE_LEVELS=3
+      
+      # Orderbook Configuration
+      - ORDERBOOK_DEPTH_PERCENT=1.0
+      - ORDERBOOK_UPDATE_INTERVAL_SEC=5
+    volumes:
+      - crypto-orderflow-data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8022/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - mcp-network
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  crypto-orderflow-data:
+    driver: local
+
+networks:
+  mcp-network:
+    driver: bridge
