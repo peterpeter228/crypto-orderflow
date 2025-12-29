@@ -231,6 +231,12 @@ class AggTradesBackfiller:
         tick_size = self.settings.get_tick_size(symbol)
         requests_made = 0
         trades_fetched = 0
+        day_trades_by_source: dict[str, int] = {"vision": 0, "rest": 0}
+        day_rows_by_source: dict[str, dict[str, int]] = {
+            "vision": {"footprint": 0, "daily": 0},
+            "rest": {"footprint": 0, "daily": 0},
+        }
+        current_source = "rest"
 
         # Aggregations (flush periodically to keep memory bounded)
         fp: dict[tuple[str, int, float], list[float]] = defaultdict(lambda: [0.0, 0.0, 0.0])
@@ -255,7 +261,7 @@ class AggTradesBackfiller:
                 )
 
         async def flush() -> None:
-            nonlocal fp, dt, vwap, session_map
+            nonlocal fp, dt, vwap, session_map, day_rows_by_source, current_source
 
             if fp:
                 fp_rows = [
@@ -264,6 +270,7 @@ class AggTradesBackfiller:
                 ]
                 await self.storage.bulk_upsert_footprint(fp_rows)
                 fp.clear()
+                day_rows_by_source[current_source]["footprint"] += len(fp_rows)
 
             if dt:
                 dt_rows = [
@@ -272,6 +279,7 @@ class AggTradesBackfiller:
                 ]
                 await self.storage.bulk_upsert_daily_trades(dt_rows)
                 dt.clear()
+                day_rows_by_source[current_source]["daily"] += len(dt_rows)
 
             if vwap:
                 vwap_rows = [
@@ -325,7 +333,7 @@ class AggTradesBackfiller:
                 boundary_reached: whether we encountered a trade at/after stop_ts (and therefore
                                   should stop paging for this chunk)
             """
-            nonlocal trades_fetched, last_processed_id
+            nonlocal trades_fetched, last_processed_id, day_trades_by_source
 
             processed_any = False
             boundary_reached = False
@@ -345,6 +353,7 @@ class AggTradesBackfiller:
 
                 processed_any = True
                 trades_fetched += 1
+                day_trades_by_source[current_source] += 1
 
                 day_start = get_day_start_ms(tr.timestamp)
                 minute_start = (tr.timestamp // 60_000) * 60_000
@@ -404,6 +413,15 @@ class AggTradesBackfiller:
 
             return processed_any, boundary_reached
 
+        async def verify_day_counts(day_start: int, day_end: int) -> None:
+            """Assert that aggregates exist for the processed day."""
+            coverage = await self.storage.get_footprint_coverage(symbol, day_start, day_end)
+            daily = await self.storage.get_daily_trades(symbol, day_start)
+            assert coverage.get("minute_buckets", 0) > 0 and len(daily) > 0, (
+                f"Expected footprint and daily_trades rows for {symbol} {day_start}, "
+                f"got coverage={coverage} daily_rows={len(daily)}"
+            )
+
         if not days_to_backfill:
             # Nothing to do.
             elapsed = timestamp_ms() - t0
@@ -435,6 +453,18 @@ class AggTradesBackfiller:
             if day_range_end <= day_range_start:
                 continue
 
+            # Reset per-day counters
+            day_trades_by_source = {"vision": 0, "rest": 0}
+            day_rows_by_source = {
+                "vision": {"footprint": 0, "daily": 0},
+                "rest": {"footprint": 0, "daily": 0},
+            }
+            current_source = "rest"
+            fallback_used = False
+            rest_attempted = False
+            day_date = datetime.fromtimestamp(day_start / 1000.0, tz=timezone.utc).date()
+            skip_rest = False
+
             # Prefer Binance Vision for completed (past) UTC days.
             # This avoids hammering `/fapi/v1/aggTrades` and triggering 429 rate limits.
             use_vision = (
@@ -442,6 +472,7 @@ class AggTradesBackfiller:
                 and self.settings.backfill_source in ("auto", "vision")
                 and (day_start + ms_in_day) <= today_start_ms
             )
+            vision_ok = False
             if use_vision:
                 if max_requests is not None and requests_made >= max_requests:
                     self.logger.warning(
@@ -453,7 +484,6 @@ class AggTradesBackfiller:
                     capped = True
                     break
 
-                day_date = datetime.fromtimestamp(day_start / 1000.0, tz=timezone.utc).date()
                 self.logger.info(
                     "backfill_day_vision_start",
                     symbol=symbol,
@@ -461,7 +491,7 @@ class AggTradesBackfiller:
                     range_start=day_range_start,
                     range_end=day_range_end,
                 )
-                vision_ok = False
+                current_source = "vision"
                 try:
                     batch: list[AggTrade] = []
                     async for tr in self.vision.iter_daily_aggtrades(
@@ -499,12 +529,21 @@ class AggTradesBackfiller:
                 # Count the Vision fetch attempt as a single request for stats/capping purposes.
                 requests_made += 1
 
-                if vision_ok:
+                vision_trades = day_trades_by_source["vision"]
+                vision_rows = day_rows_by_source["vision"]
+                if vision_ok and (
+                    vision_trades == 0 or (vision_rows["footprint"] == 0 and vision_rows["daily"] == 0)
+                ):
+                    vision_ok = False
                     self.logger.info(
-                        "backfill_day_vision_done",
+                        "backfill_day_vision_empty",
                         symbol=symbol,
                         day=str(day_date),
+                        vision_trades=vision_trades,
+                        vision_footprint_rows=vision_rows["footprint"],
+                        vision_daily_rows=vision_rows["daily"],
                     )
+<<<<<<< ours
                     await flush()
                     await verify_day_counts(day_start)
                     continue
@@ -515,51 +554,28 @@ class AggTradesBackfiller:
                     symbol=symbol,
                     day=str(day_date),
                 )
+=======
+>>>>>>> theirs
 
-            chunk_start = day_range_start
-            while chunk_start < day_range_end:
-                if max_requests is not None and requests_made >= max_requests:
-                    self.logger.warning(
-                        "backfill_request_cap_hit",
+                if vision_ok:
+                    skip_rest = True
+                else:
+                    fallback_used = True
+                    # If Vision is configured but unavailable for this day, fall back to REST.
+                    self.logger.info(
+                        "backfill_day_vision_fallback_to_rest",
                         symbol=symbol,
-                        requests_made=requests_made,
-                        max_requests=max_requests,
+                        day=str(day_date),
+                        vision_trades=vision_trades,
+                        vision_footprint_rows=vision_rows["footprint"],
+                        vision_daily_rows=vision_rows["daily"],
                     )
-                    capped = True
-                    break
 
-                chunk_end = min(day_range_end, chunk_start + chunk_ms)
-
-                # First page for this chunk uses startTime+endTime (<=60 min)
-                trades = await self.rest.get_agg_trades(
-                    symbol=symbol,
-                    start_time=chunk_start,
-                    end_time=chunk_end,
-                    limit=1000,
-                )
-                requests_made += 1
-
-                processed_any, boundary_reached = _process_page(trades, chunk_end)
-
-                # Periodic flush
-                if len(fp) >= FLUSH_KEYS or len(dt) >= FLUSH_KEYS:
-                    await flush()
-
-                if pause_ms > 0:
-                    await asyncio.sleep(pause_ms / 1000.0)
-
-                # If the initial page already crossed the boundary (or had no trades), stop paging.
-                if not trades or boundary_reached or not processed_any:
-                    chunk_start = chunk_end
-                    continue
-
-                # If less than the limit returned, we're done for this chunk.
-                if len(trades) < 1000:
-                    chunk_start = chunk_end
-                    continue
-
-                # There may be more trades within the chunk; continue paging via fromId only.
-                while True:
+            if not skip_rest:
+                current_source = "rest"
+                rest_attempted = True
+                chunk_start = day_range_start
+                while chunk_start < day_range_end:
                     if max_requests is not None and requests_made >= max_requests:
                         self.logger.warning(
                             "backfill_request_cap_hit",
@@ -570,32 +586,101 @@ class AggTradesBackfiller:
                         capped = True
                         break
 
-                    if last_processed_id is None:
-                        break
+                    chunk_end = min(day_range_end, chunk_start + chunk_ms)
 
-                    next_from_id = last_processed_id + 1
-                    page = await self.rest.get_agg_trades(
+                    # First page for this chunk uses startTime+endTime (<=60 min)
+                    trades = await self.rest.get_agg_trades(
                         symbol=symbol,
-                        from_id=next_from_id,
+                        start_time=chunk_start,
+                        end_time=chunk_end,
                         limit=1000,
                     )
                     requests_made += 1
 
-                    processed_any2, boundary_reached2 = _process_page(page, chunk_end)
+                    processed_any, boundary_reached = _process_page(trades, chunk_end)
 
+                    # Periodic flush
                     if len(fp) >= FLUSH_KEYS or len(dt) >= FLUSH_KEYS:
                         await flush()
 
                     if pause_ms > 0:
                         await asyncio.sleep(pause_ms / 1000.0)
 
-                    if not page or boundary_reached2 or not processed_any2:
-                        break
+                    # If the initial page already crossed the boundary (or had no trades), stop paging.
+                    if not trades or boundary_reached or not processed_any:
+                        chunk_start = chunk_end
+                        continue
 
-                    if len(page) < 1000:
-                        break
+                    # If less than the limit returned, we're done for this chunk.
+                    if len(trades) < 1000:
+                        chunk_start = chunk_end
+                        continue
 
-                chunk_start = chunk_end
+                    # There may be more trades within the chunk; continue paging via fromId only.
+                    while True:
+                        if max_requests is not None and requests_made >= max_requests:
+                            self.logger.warning(
+                                "backfill_request_cap_hit",
+                                symbol=symbol,
+                                requests_made=requests_made,
+                                max_requests=max_requests,
+                            )
+                            capped = True
+                            break
+
+                        if last_processed_id is None:
+                            break
+
+                        next_from_id = last_processed_id + 1
+                        page = await self.rest.get_agg_trades(
+                            symbol=symbol,
+                            from_id=next_from_id,
+                            limit=1000,
+                        )
+                        requests_made += 1
+
+                        processed_any2, boundary_reached2 = _process_page(page, chunk_end)
+
+                        if len(fp) >= FLUSH_KEYS or len(dt) >= FLUSH_KEYS:
+                            await flush()
+
+                        if pause_ms > 0:
+                            await asyncio.sleep(pause_ms / 1000.0)
+
+                        if not page or boundary_reached2 or not processed_any2:
+                            break
+
+                        if len(page) < 1000:
+                            break
+
+                    chunk_start = chunk_end
+                await flush()
+            else:
+                self.logger.info(
+                    "backfill_day_vision_done",
+                    symbol=symbol,
+                    day=str(day_date),
+                    vision_trades=day_trades_by_source["vision"],
+                    vision_footprint_rows=day_rows_by_source["vision"]["footprint"],
+                    vision_daily_rows=day_rows_by_source["vision"]["daily"],
+                )
+
+            self.logger.info(
+                "backfill_day_counts",
+                symbol=symbol,
+                day=str(day_date),
+                vision_trades=day_trades_by_source["vision"],
+                rest_trades=day_trades_by_source["rest"],
+                vision_footprint_rows=day_rows_by_source["vision"]["footprint"],
+                vision_daily_rows=day_rows_by_source["vision"]["daily"],
+                rest_footprint_rows=day_rows_by_source["rest"]["footprint"],
+                rest_daily_rows=day_rows_by_source["rest"]["daily"],
+                fallback_used=fallback_used,
+                rest_attempted=rest_attempted,
+            )
+
+            if not capped:
+                await verify_day_counts(day_range_start, day_range_end)
 
             # Ensure any buffered rows for the day are persisted before verification.
             await flush()
