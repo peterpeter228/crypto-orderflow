@@ -55,7 +55,7 @@ class CryptoOrderflowServer:
         
         # Indicators
         self.vwap = VWAPCalculator(self.storage)
-        self.volume_profile = VolumeProfileCalculator(self.storage)
+        self.volume_profile = VolumeProfileCalculator(self.storage, rest_client=self.rest_client)
         self.tpo_profile = TPOProfileCalculator(self.storage)
         self.session_levels = SessionLevelsCalculator(self.storage)
         self.footprint = FootprintCalculator(self.storage)

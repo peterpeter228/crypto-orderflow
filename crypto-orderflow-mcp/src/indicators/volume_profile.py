@@ -1,12 +1,14 @@
 """Volume Profile calculator (POC, VAH, VAL)."""
 
-from typing import Any
+from typing import Any, Iterable, Tuple
 from collections import defaultdict
 
 from src.data.storage import DataStorage
+from src.binance.rest_client import BinanceRestClient
+from src.binance.types import Kline
 from src.config import get_settings
 from src.utils import get_logger, timestamp_ms, round_to_tick
-from src.utils.helpers import get_day_start_ms, get_yesterday_range_ms
+from src.utils.helpers import get_day_start_ms
 
 # Milliseconds in one day (UTC)
 MS_IN_DAY = 86_400_000
@@ -15,8 +17,9 @@ MS_IN_DAY = 86_400_000
 class VolumeProfileCalculator:
     """Calculate Volume Profile with POC, VAH, VAL."""
     
-    def __init__(self, storage: DataStorage):
+    def __init__(self, storage: DataStorage, rest_client: BinanceRestClient | None = None):
         self.storage = storage
+        self.rest_client = rest_client
         self.settings = get_settings()
         self.logger = get_logger("indicators.volume_profile")
         
@@ -177,17 +180,18 @@ class VolumeProfileCalculator:
         val = sorted_prices[val_idx]
         return poc, vah, val
 
-    def build_quote_profile(self, rows: list[dict[str, Any]]) -> dict[float, float]:
-        """Build a *quote-denominated* (USDT) volume profile from storage rows.
+    def _build_quote_profile_with_vwap(
+        self, rows: Iterable[dict[str, Any]], *, include_total_volume: bool = False
+    ) -> Tuple[dict[float, float], float | None]:
+        """Build a quote-denominated profile and VWAP from aggregated rows.
 
-        The storage layer returns volumes in base units (e.g. BTC).
-        Exocharts (and many orderflow platforms) often display *synthetic* volume
-        as `base_volume * price` for linear contracts. We therefore convert each
-        price-level's volume into quote (USDT) and aggregate by price level.
-
-        Expected row keys: price_level, buy_volume, sell_volume, total_volume.
+        Returns a tuple of (profile, vwap). VWAP is computed from the sum of base
+        volume and quote notional when available.
         """
         profile: dict[float, float] = {}
+        total_quote = 0.0
+        total_base = 0.0
+
         for r in rows:
             try:
                 price = float(r.get("price_level"))
@@ -196,7 +200,7 @@ class VolumeProfileCalculator:
 
             buy_v = float(r.get("buy_volume") or 0.0)
             sell_v = float(r.get("sell_volume") or 0.0)
-            total_v = float(r.get("total_volume") or 0.0)
+            total_v = float(r.get("total_volume") or 0.0) if include_total_volume else 0.0
 
             # Prefer buy+sell if provided, otherwise fall back to total_volume.
             base_v = buy_v + sell_v
@@ -208,7 +212,46 @@ class VolumeProfileCalculator:
                 continue
 
             profile[price] = float(profile.get(price, 0.0) + quote_v)
+            total_quote += quote_v
+            total_base += base_v
+
+        vwap = (total_quote / total_base) if total_base > 0 else None
+        return profile, vwap
+
+    def build_quote_profile(self, rows: list[dict[str, Any]]) -> dict[float, float]:
+        """Backward-compatible wrapper to build a quote profile from rows."""
+        profile, _ = self._build_quote_profile_with_vwap(rows, include_total_volume=True)
         return profile
+
+    def build_kline_profile(self, symbol: str, klines: list[Kline]) -> tuple[dict[float, float], float | None]:
+        """Build a coarse quote-volume profile and VWAP from klines."""
+        tick_size = self.settings.get_tick_size(symbol)
+        profile: dict[float, float] = defaultdict(float)
+        total_quote = 0.0
+        total_base = 0.0
+
+        for k in klines:
+            try:
+                typical_price = (float(k.high) + float(k.low) + float(k.close)) / 3.0
+            except Exception:
+                continue
+
+            base_v = float(k.volume or 0.0)
+            quote_v = float(k.quote_volume or 0.0)
+            if quote_v <= 0 and base_v > 0:
+                quote_v = base_v * typical_price
+
+            if quote_v <= 0:
+                continue
+
+            level = round_to_tick(typical_price, tick_size) if tick_size and tick_size > 0 else typical_price
+            profile[level] += quote_v
+            total_quote += quote_v
+            if base_v > 0:
+                total_base += base_v
+
+        vwap = (total_quote / total_base) if total_base > 0 else None
+        return dict(profile), vwap
     
     async def get_today_profile(self, symbol: str) -> dict[float, float]:
         """Get today's volume profile.
@@ -301,10 +344,19 @@ class VolumeProfileCalculator:
         dev_end = now_ms if is_current_day else day_end
         prev_day_start = day_start - MS_IN_DAY
 
-        async def _load_profile(start_ms: int, end_ms: int) -> dict[float, float]:
+        async def _load_profile(start_ms: int, end_ms: int) -> tuple[dict[float, float], str | None, float | None]:
+            """Load profile with multi-level fallback.
+
+            Order:
+                1) footprint_1m (highest fidelity)
+                2) daily_trades
+                3) Binance klines (coarse backup)
+            """
             try:
                 rows = await self.storage.get_profile_range(symbol, start_ms, end_ms)
-                return self.build_quote_profile(rows)
+                profile, vwap = self._build_quote_profile_with_vwap(rows, include_total_volume=True)
+                if profile:
+                    return profile, "footprint_1m", vwap
             except Exception as e:
                 self.logger.warning(
                     "volume_profile_storage_read_failed",
@@ -313,13 +365,64 @@ class VolumeProfileCalculator:
                     start_ms=start_ms,
                     end_ms=end_ms,
                 )
-                return {}
+
+            try:
+                rows = await self.storage.get_daily_trades(symbol, start_ms)
+                if rows:
+                    profile: dict[float, float] = defaultdict(float)
+                    total_quote = 0.0
+                    total_base = 0.0
+                    for row in rows:
+                        price = float(row.get("price_level"))
+                        notional = float(row.get("notional") or 0.0)
+                        base_v = float(row.get("volume") or 0.0)
+                        if notional <= 0 and base_v > 0:
+                            notional = base_v * price
+                        if notional <= 0:
+                            continue
+                        profile[price] += notional
+                        total_quote += notional
+                        if base_v > 0:
+                            total_base += base_v
+                    vwap = (total_quote / total_base) if total_base > 0 else None
+                    return dict(profile), "daily_trades", vwap
+            except Exception as e:
+                self.logger.warning(
+                    "volume_profile_daily_trades_failed",
+                    symbol=symbol,
+                    error=str(e),
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                )
+
+            if self.rest_client:
+                try:
+                    klines = await self.rest_client.get_klines(
+                        symbol=symbol,
+                        interval="1m",
+                        start_time=start_ms,
+                        end_time=end_ms,
+                        limit=1500,
+                    )
+                    profile, vwap = self.build_kline_profile(symbol, klines)
+                    if profile:
+                        return profile, "binance_klines", vwap
+                except Exception as e:
+                    self.logger.warning(
+                        "volume_profile_kline_fallback_failed",
+                        symbol=symbol,
+                        error=str(e),
+                        start_ms=start_ms,
+                        end_ms=end_ms,
+                    )
+
+            return {}, None, None
 
         # Profiles (quote-denominated)
-        today_profile = await _load_profile(day_start, dev_end)
+        today_profile, today_source, today_vwap = await _load_profile(day_start, dev_end)
         d_poc, d_vah, d_val = self.calculate_value_area(today_profile)
 
-        yesterday_profile = await _load_profile(prev_day_start, day_start)
+        yesterday_profile, yesterday_source, yesterday_vwap = await _load_profile(prev_day_start, day_start)
         pd_poc, pd_vah, pd_val = self.calculate_value_area(yesterday_profile)
 
         # Coverage / completeness diagnostics
@@ -356,22 +459,28 @@ class VolumeProfileCalculator:
                 'POC': d_poc,
                 'VAH': d_vah,
                 'VAL': d_val,
+                'VWAP': today_vwap,
                 'high': max(today_profile.keys()) if today_profile else None,
                 'low': min(today_profile.keys()) if today_profile else None,
                 'totalVolume': float(sum(today_profile.values())) if today_profile else 0.0,
                 'priceLevels': len(today_profile),
                 'coverage': cov_today,
+                'source': today_source,
+                'usingFallback': today_source not in (None, "footprint_1m"),
             },
             'previousDay': {
                 'POC': pd_poc,
                 'VAH': pd_vah,
                 'VAL': pd_val,
+                'VWAP': yesterday_vwap,
                 'high': max(yesterday_profile.keys()) if yesterday_profile else None,
                 'low': min(yesterday_profile.keys()) if yesterday_profile else None,
                 'totalVolume': float(sum(yesterday_profile.values())) if yesterday_profile else 0.0,
                 'priceLevels': len(yesterday_profile),
                 'coverage': cov_yesterday,
                 'complete': pd_complete,
+                'source': yesterday_source,
+                'usingFallback': yesterday_source not in (None, "footprint_1m"),
             },
             'unit': 'USDT',
         }
