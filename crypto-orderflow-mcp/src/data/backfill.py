@@ -543,20 +543,6 @@ class AggTradesBackfiller:
                         vision_footprint_rows=vision_rows["footprint"],
                         vision_daily_rows=vision_rows["daily"],
                     )
-<<<<<<< ours
-                    await flush()
-                    await verify_day_counts(day_start)
-                    continue
-
-                # If Vision is configured but unavailable for this day, fall back to REST.
-                self.logger.info(
-                    "backfill_day_vision_fallback_to_rest",
-                    symbol=symbol,
-                    day=str(day_date),
-                )
-=======
->>>>>>> theirs
-
                 if vision_ok:
                     skip_rest = True
                 else:
