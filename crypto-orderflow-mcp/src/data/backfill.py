@@ -239,6 +239,21 @@ class AggTradesBackfiller:
         day_cvd: dict[int, float] = defaultdict(float)
         session_map: dict[tuple[str, int, str], dict[str, float]] = {}
 
+        async def verify_day_counts(day_start: int) -> None:
+            counts = await self.storage.get_day_row_counts(symbol, day_start)
+            if counts["footprint_rows"] == 0 or counts["daily_trade_rows"] == 0:
+                self.logger.error(
+                    "backfill_day_missing_rows",
+                    symbol=symbol,
+                    day_start=day_start,
+                    footprint_rows=counts["footprint_rows"],
+                    daily_trade_rows=counts["daily_trade_rows"],
+                )
+                assert counts["footprint_rows"] > 0 and counts["daily_trade_rows"] > 0, (
+                    f"Backfill wrote zero rows for day {day_start} "
+                    f"(footprint={counts['footprint_rows']}, daily_trades={counts['daily_trade_rows']})"
+                )
+
         async def flush() -> None:
             nonlocal fp, dt, vwap, session_map
 
@@ -490,6 +505,8 @@ class AggTradesBackfiller:
                         symbol=symbol,
                         day=str(day_date),
                     )
+                    await flush()
+                    await verify_day_counts(day_start)
                     continue
 
                 # If Vision is configured but unavailable for this day, fall back to REST.
@@ -580,9 +597,12 @@ class AggTradesBackfiller:
 
                 chunk_start = chunk_end
 
+            # Ensure any buffered rows for the day are persisted before verification.
+            await flush()
+            await verify_day_counts(day_start)
+
         # Final flush
         await flush()
-
         elapsed = timestamp_ms() - t0
         cvd_end = None
         end_day = get_day_start_ms(end_time)

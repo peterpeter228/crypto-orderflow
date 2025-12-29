@@ -50,7 +50,7 @@ class TestOrderbookManager:
         """Create OrderbookManager instance."""
         return OrderbookManager(mock_rest_client)
     
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_initialize_orderbook(self, manager):
         """Test orderbook initialization from snapshot."""
         await manager.initialize_orderbook("BTCUSDT")
@@ -63,7 +63,7 @@ class TestOrderbookManager:
         assert len(ob["bids"]) == 3
         assert len(ob["asks"]) == 3
     
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_get_best_bid_ask(self, manager):
         """Test getting best bid/ask."""
         await manager.initialize_orderbook("BTCUSDT")
@@ -75,7 +75,7 @@ class TestOrderbookManager:
         assert best_bid == 50000.0
         assert best_ask == 50001.0
     
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_get_mid_price(self, manager):
         """Test getting mid price."""
         await manager.initialize_orderbook("BTCUSDT")
@@ -84,7 +84,7 @@ class TestOrderbookManager:
         
         assert mid == 50000.5  # (50000 + 50001) / 2
     
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_get_depth_within_percent(self, manager):
         """Test getting depth within price range."""
         await manager.initialize_orderbook("BTCUSDT")
@@ -97,7 +97,7 @@ class TestOrderbookManager:
         assert "netVolume" in depth
         assert "midPrice" in depth
     
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_process_update_valid(self, manager):
         """Test processing valid orderbook update."""
         await manager.initialize_orderbook("BTCUSDT")
@@ -119,7 +119,7 @@ class TestOrderbookManager:
         assert ob is not None
         assert ob["lastUpdateId"] == 101
     
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_process_update_removes_zero_quantity(self, manager):
         """Test that zero quantity removes price level."""
         await manager.initialize_orderbook("BTCUSDT")
@@ -179,7 +179,7 @@ class TestOrderbookConsistency:
         """Create OrderbookManager instance."""
         return OrderbookManager(mock_rest_client)
     
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_gap_detection_triggers_rebuild(self, manager):
         """Test that sequence gap triggers orderbook rebuild."""
         await manager.initialize_orderbook("BTCUSDT")

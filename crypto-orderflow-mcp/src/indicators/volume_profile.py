@@ -301,10 +301,32 @@ class VolumeProfileCalculator:
         dev_end = now_ms if is_current_day else day_end
         prev_day_start = day_start - MS_IN_DAY
 
-        async def _load_profile(start_ms: int, end_ms: int) -> dict[float, float]:
+        async def _load_profile(start_ms: int, end_ms: int, *, fallback_day: int | None = None) -> dict[float, float]:
             try:
                 rows = await self.storage.get_profile_range(symbol, start_ms, end_ms)
-                return self.build_quote_profile(rows)
+                if rows:
+                    return self.build_quote_profile(rows)
+
+                coverage = await self.storage.get_footprint_coverage(symbol, start_ms, end_ms)
+                minute_buckets = int(coverage.get("minuteBuckets") or coverage.get("minute_buckets") or 0)
+                if minute_buckets == 0 and fallback_day is not None:
+                    self.logger.warning(
+                        "volume_profile_footprint_missing_fallback_daily",
+                        symbol=symbol,
+                        fallback_day=fallback_day,
+                        start_ms=start_ms,
+                        end_ms=end_ms,
+                    )
+                    daily_rows = await self.storage.get_daily_trades(symbol, fallback_day)
+                    if daily_rows:
+                        profile = {
+                            row["price_level"]: float(row.get("notional", 0.0))
+                            for row in daily_rows
+                            if row.get("price_level") is not None
+                        }
+                        return profile
+
+                return {}
             except Exception as e:
                 self.logger.warning(
                     "volume_profile_storage_read_failed",
@@ -316,10 +338,10 @@ class VolumeProfileCalculator:
                 return {}
 
         # Profiles (quote-denominated)
-        today_profile = await _load_profile(day_start, dev_end)
+        today_profile = await _load_profile(day_start, dev_end, fallback_day=day_start)
         d_poc, d_vah, d_val = self.calculate_value_area(today_profile)
 
-        yesterday_profile = await _load_profile(prev_day_start, day_start)
+        yesterday_profile = await _load_profile(prev_day_start, day_start, fallback_day=prev_day_start)
         pd_poc, pd_vah, pd_val = self.calculate_value_area(yesterday_profile)
 
         # Coverage / completeness diagnostics

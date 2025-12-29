@@ -168,7 +168,7 @@ class TestFootprintCalculatorClass:
         """Create FootprintCalculator instance."""
         return FootprintCalculator(mock_storage)
     
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_update_creates_bar(self, calculator):
         """Test that update creates footprint bar."""
         await calculator.update(
@@ -185,7 +185,7 @@ class TestFootprintCalculatorClass:
         assert bar.total_buy_volume == 1.0
         assert bar.total_sell_volume == 0.0
     
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_update_sell_trade(self, calculator):
         """Test update with sell trade (is_buyer_maker=True)."""
         await calculator.update(
@@ -202,7 +202,7 @@ class TestFootprintCalculatorClass:
         assert bar.total_buy_volume == 0.0
         assert bar.total_sell_volume == 1.0
     
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_update_aggregates_at_price_level(self, calculator):
         """Test that trades at same price level are aggregated."""
         await calculator.update("BTCUSDT", 50000.0, 1.0, False, 0)
