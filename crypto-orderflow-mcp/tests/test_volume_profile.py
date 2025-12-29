@@ -3,10 +3,13 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
+from src.binance.types import Kline
 from src.indicators.volume_profile import (
     VolumeProfileCalculator,
     calculate_volume_profile,
 )
+from src.utils import timestamp_ms
+from src.utils.helpers import get_day_start_ms
 
 
 class TestVolumeProfileCalculation:
@@ -145,19 +148,19 @@ class TestVolumeProfileCalculatorClass:
         """Create VolumeProfileCalculator instance."""
         return VolumeProfileCalculator(mock_storage)
     
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_update_accumulates_volume(self, calculator):
         """Test that update accumulates volume at price levels."""
         symbol = "BTCUSDT"
-        timestamp = 1700000000000
+        timestamp = get_day_start_ms(timestamp_ms()) + 1_000
         
         await calculator.update(symbol, 50000.0, 1.0, 0.6, 0.4, timestamp)
         await calculator.update(symbol, 50000.0, 0.5, 0.3, 0.2, timestamp)
-        
+    
         profile = await calculator.get_today_profile(symbol)
-        
+    
         assert 50000.0 in profile
-        assert profile[50000.0] == 1.5  # 1.0 + 0.5
+        assert profile[50000.0] == pytest.approx(75000.0)  # Quote notional: 50000 * (1.0 + 0.5)
     
     def test_reset_day_clears_profile(self, calculator):
         """Test that reset_day clears the profile."""
@@ -168,3 +171,61 @@ class TestVolumeProfileCalculatorClass:
         
         assert symbol in calculator._profiles
         assert len(calculator._profiles[symbol]) == 0
+
+    @pytest.mark.anyio
+    async def test_kline_fallback_used_when_storage_empty(self):
+        """Ensure kline fallback populates profile and marks source."""
+        symbol = "BTCUSDT"
+        day_start = get_day_start_ms(timestamp_ms())
+
+        storage = MagicMock()
+        storage.get_profile_range = AsyncMock(return_value=[])
+        storage.get_daily_trades = AsyncMock(return_value=[])
+        storage.get_footprint_coverage = AsyncMock(
+            return_value={"minuteBuckets": 0, "minTs": None, "maxTs": None}
+        )
+
+        k1 = Kline(
+            symbol=symbol,
+            interval="1m",
+            open_time=day_start,
+            open=100.0,
+            high=110.0,
+            low=90.0,
+            close=105.0,
+            volume=10.0,
+            close_time=day_start + 60_000,
+            quote_volume=1050.0,
+            trade_count=100,
+            taker_buy_volume=5.0,
+            taker_buy_quote_volume=525.0,
+        )
+        k2 = Kline(
+            symbol=symbol,
+            interval="1m",
+            open_time=day_start + 60_000,
+            open=105.0,
+            high=112.0,
+            low=95.0,
+            close=108.0,
+            volume=9.0,
+            close_time=day_start + 120_000,
+            quote_volume=972.0,
+            trade_count=80,
+            taker_buy_volume=4.0,
+            taker_buy_quote_volume=432.0,
+        )
+        rest_client = MagicMock()
+        rest_client.get_klines = AsyncMock(return_value=[k1, k2])
+
+        calculator = VolumeProfileCalculator(storage, rest_client=rest_client)
+
+        result = await calculator.get_key_levels(symbol, date=day_start)
+        developing = result["developing"]
+
+        assert developing["source"] == "binance_klines"
+        assert developing["usingFallback"] is True
+        assert developing["POC"] is not None
+        assert developing["VAH"] is not None
+        assert developing["VAL"] is not None
+        assert developing["VWAP"] is not None
