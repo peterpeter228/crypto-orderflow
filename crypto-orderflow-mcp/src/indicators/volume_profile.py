@@ -344,7 +344,25 @@ class VolumeProfileCalculator:
 
         cov_today = _coverage(cov_today_raw, day_start, dev_end)
         cov_yesterday = _coverage(cov_yesterday_raw, prev_day_start, day_start)
-        pd_complete = cov_yesterday['coveragePct'] >= 0.95
+        # Coverage thresholds: relaxed for the developing/current day, stricter for completed days.
+        dev_threshold = 0.3 if is_current_day else 0.9
+        prev_threshold = 0.9
+
+        warnings: list[str] = []
+
+        dev_provisional = cov_today['coveragePct'] < dev_threshold
+        if dev_provisional:
+            warnings.append(
+                f"Developing profile coverage low ({cov_today['coveragePct']*100:.1f}% < {dev_threshold*100:.0f}%). "
+                "POC/VA values are provisional."
+            )
+
+        pd_complete = cov_yesterday['coveragePct'] >= prev_threshold
+        if not pd_complete:
+            warnings.append(
+                f"Previous day profile incomplete ({cov_yesterday['coveragePct']*100:.1f}% < {prev_threshold*100:.0f}%). "
+                "POC/VA values are provisional."
+            )
 
         return {
             'symbol': symbol,
@@ -361,6 +379,7 @@ class VolumeProfileCalculator:
                 'totalVolume': float(sum(today_profile.values())) if today_profile else 0.0,
                 'priceLevels': len(today_profile),
                 'coverage': cov_today,
+                'provisional': dev_provisional,
             },
             'previousDay': {
                 'POC': pd_poc,
@@ -372,8 +391,10 @@ class VolumeProfileCalculator:
                 'priceLevels': len(yesterday_profile),
                 'coverage': cov_yesterday,
                 'complete': pd_complete,
+                'provisional': not pd_complete,
             },
             'unit': 'USDT',
+            'warnings': warnings,
         }
 
     def reset_day(self, symbol: str) -> None:
