@@ -86,7 +86,7 @@ class TestSessionHighLow:
         """Create SessionLevelsCalculator instance."""
         return SessionLevelsCalculator(mock_storage)
     
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_update_tracks_high(self, calculator):
         """Test that update tracks session high correctly."""
         symbol = "BTCUSDT"
@@ -104,7 +104,7 @@ class TestSessionHighLow:
         assert "tokyo" in levels
         assert levels["tokyo"]["high"] == 51000.0
     
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_update_tracks_low(self, calculator):
         """Test that update tracks session low correctly."""
         symbol = "BTCUSDT"
@@ -122,7 +122,7 @@ class TestSessionHighLow:
         assert "tokyo" in levels
         assert levels["tokyo"]["low"] == 49000.0
     
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_update_tracks_volume(self, calculator):
         """Test that update accumulates session volume."""
         symbol = "BTCUSDT"

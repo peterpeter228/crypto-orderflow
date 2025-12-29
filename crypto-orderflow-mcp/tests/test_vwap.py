@@ -77,7 +77,7 @@ class TestVWAPCalculatorClass:
         """Create VWAPCalculator instance."""
         return VWAPCalculator(mock_storage)
     
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_update_accumulates_values(self, calculator):
         """Test that update accumulates price*volume and volume."""
         symbol = "BTCUSDT"
@@ -92,7 +92,7 @@ class TestVWAPCalculatorClass:
         assert vwap is not None
         assert abs(vwap - 50666.67) < 1
     
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_get_vwap_returns_none_for_unknown_symbol(self, calculator):
         """Test that get_vwap returns None for unknown symbol."""
         vwap = calculator.get_vwap("UNKNOWN")

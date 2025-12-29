@@ -145,11 +145,13 @@ class TestVolumeProfileCalculatorClass:
         """Create VolumeProfileCalculator instance."""
         return VolumeProfileCalculator(mock_storage)
     
-    @pytest.mark.asyncio
-    async def test_update_accumulates_volume(self, calculator):
+    @pytest.mark.anyio
+    async def test_update_accumulates_volume(self, calculator, monkeypatch):
         """Test that update accumulates volume at price levels."""
         symbol = "BTCUSDT"
         timestamp = 1700000000000
+
+        monkeypatch.setattr("src.indicators.volume_profile.timestamp_ms", lambda: timestamp)
         
         await calculator.update(symbol, 50000.0, 1.0, 0.6, 0.4, timestamp)
         await calculator.update(symbol, 50000.0, 0.5, 0.3, 0.2, timestamp)
@@ -157,7 +159,7 @@ class TestVolumeProfileCalculatorClass:
         profile = await calculator.get_today_profile(symbol)
         
         assert 50000.0 in profile
-        assert profile[50000.0] == 1.5  # 1.0 + 0.5
+        assert profile[50000.0] == 75000.0  # quote volume (notional) for 1.5 base volume
     
     def test_reset_day_clears_profile(self, calculator):
         """Test that reset_day clears the profile."""
@@ -168,3 +170,31 @@ class TestVolumeProfileCalculatorClass:
         
         assert symbol in calculator._profiles
         assert len(calculator._profiles[symbol]) == 0
+
+    @pytest.mark.anyio
+    async def test_get_key_levels_fallback_to_daily_trades(self, monkeypatch):
+        """When footprint is empty but daily trades exist, previous day key levels should be populated."""
+        # Fixed timestamp aligned to a UTC day boundary for deterministic ranges.
+        fixed_ts = 1_700_000_000_000
+        day_start = (fixed_ts // 86_400_000) * 86_400_000
+        monkeypatch.setattr("src.indicators.volume_profile.timestamp_ms", lambda: fixed_ts)
+
+        storage = MagicMock()
+        storage.get_profile_range = AsyncMock(side_effect=[[], []])
+        storage.get_footprint_coverage = AsyncMock(return_value={"minute_buckets": 0, "min_ts": None, "max_ts": None})
+        storage.get_daily_trades = AsyncMock(
+            side_effect=[
+                [],  # today fallback (empty)
+                [
+                    {"price_level": 100.0, "notional": 200.0},
+                    {"price_level": 101.0, "notional": 300.0},
+                ],
+            ]
+        )
+
+        calculator = VolumeProfileCalculator(storage)
+        levels = await calculator.get_key_levels("BTCUSDT", date=day_start)
+
+        assert levels["previousDay"]["POC"] is not None
+        assert levels["previousDay"]["VAH"] is not None
+        assert levels["previousDay"]["VAL"] is not None

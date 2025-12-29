@@ -640,7 +640,44 @@ class DataStorage:
         
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
-    
+
+
+    async def get_day_row_counts(self, symbol: str, day_start: int) -> dict[str, int]:
+        """Return row counts for a UTC day across key aggregation tables."""
+        if not self._db:
+            raise RuntimeError("Database not initialized")
+
+        symbol = symbol.upper()
+        day_end = int(day_start) + 86_400_000
+
+        async with self._lock:
+            cur = await self._db.execute(
+                """
+                SELECT COUNT(*) FROM footprint_1m
+                WHERE symbol = ? AND timestamp >= ? AND timestamp < ?
+                """,
+                (symbol, int(day_start), day_end),
+            )
+            fp_count_row = await cur.fetchone()
+            await cur.close()
+
+            cur = await self._db.execute(
+                """
+                SELECT COUNT(*) FROM daily_trades
+                WHERE symbol = ? AND date = ?
+                """,
+                (symbol, int(day_start)),
+            )
+            dt_count_row = await cur.fetchone()
+            await cur.close()
+
+        fp_count = int(fp_count_row[0]) if fp_count_row and fp_count_row[0] is not None else 0
+        dt_count = int(dt_count_row[0]) if dt_count_row and dt_count_row[0] is not None else 0
+
+        return {
+            "footprint_rows": fp_count,
+            "daily_trade_rows": dt_count,
+        }
 
     async def get_profile_range(
         self,
