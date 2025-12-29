@@ -189,6 +189,18 @@ class Settings(BaseSettings):
     imbalance_ratio_threshold: float = Field(default=3.0)
     imbalance_consecutive_levels: int = Field(default=3)
     # TPO / Market Profile
+    tpo_tick_size_btc: float = Field(
+        default=50.0,
+        description="Default TPO tick size for BTC pairs (coarser than footprint ticks).",
+    )
+    tpo_tick_size_eth: float = Field(
+        default=5.0,
+        description="Default TPO tick size for ETH pairs (coarser than footprint ticks).",
+    )
+    tpo_tick_size_default: float = Field(
+        default=1.0,
+        description="Fallback TPO tick size for other symbols when no specific default is set.",
+    )
     tpo_use_volume_for_va_default: bool = Field(
         default=False,
         description="Default for TPO POC+VA calculation: True uses volume (notional) distribution (Exocharts option).",
@@ -316,15 +328,29 @@ class Settings(BaseSettings):
         profiles are usually built on a much coarser price step.
         """
         symbol = symbol.upper()
+        default_tick = self.get_default_tpo_tick_size(symbol)
         if "BTC" in symbol:
-            return float(self.tpo_tick_size_btc)
+            return float(getattr(self, "tpo_tick_size_btc", default_tick) or default_tick)
         elif "ETH" in symbol:
-            return float(self.tpo_tick_size_eth)
+            return float(getattr(self, "tpo_tick_size_eth", default_tick) or default_tick)
 
         # Fallback: derive a reasonable coarse step from the symbol's native tick.
         # (Better than defaulting to 0.1 for unknown symbols.)
-        base_tick = float(self.get_tick_size(symbol))
-        return max(base_tick * 50.0, base_tick)
+        try:
+            base_tick = float(self.get_tick_size(symbol))
+            return max(base_tick * 50.0, base_tick, default_tick)
+        except Exception:
+            return default_tick
+
+    def get_default_tpo_tick_size(self, symbol: str) -> float:
+        """Return the class-level default TPO tick size for a symbol (no instance state required)."""
+        symbol = symbol.upper()
+        fields = self.__class__.model_fields
+        if "BTC" in symbol:
+            return float(fields["tpo_tick_size_btc"].default or 50.0)
+        if "ETH" in symbol:
+            return float(fields["tpo_tick_size_eth"].default or 5.0)
+        return float(fields["tpo_tick_size_default"].default or 1.0)
     
     def ensure_data_dir(self) -> Path:
         """Ensure data directory exists."""
