@@ -670,7 +670,7 @@ class AggTradesBackfiller:
 
             # Ensure any buffered rows for the day are persisted before verification.
             await flush()
-            await verify_day_counts(day_start)
+            await verify_day_counts(day_range_start, day_range_end)
 
         # Final flush
         await flush()

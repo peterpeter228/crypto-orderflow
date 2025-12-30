@@ -396,6 +396,7 @@ class TPOProfileCalculator:
             "tickSize": tick_size,
             "valueAreaPercent": float(value_area_percent),
             "useVolumeForVA": bool(use_volume_for_va),
+            "priceLevelCount": len(vol_profile) if use_volume_for_va else len(tpo_profile),
             "totals": {
                 "tpoTotalCount": total_tpo,
                 "notional": total_notional,
