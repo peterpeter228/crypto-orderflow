@@ -7,6 +7,7 @@ from src.data.storage import DataStorage
 from src.config import get_settings
 from src.utils import get_logger, timestamp_ms, round_to_tick
 from src.utils.helpers import get_day_start_ms
+from .profile_engine import ValueAreaCalculator
 
 # Milliseconds in one day (UTC)
 MS_IN_DAY = 86_400_000
@@ -59,7 +60,7 @@ class VolumeProfileCalculator:
             self._profile_day[symbol] = date
         
         # Track base volume for profile statistics (closer to exchange-reported volume/POC).
-        base_volume = float(volume)
+        base_volume = float(volume) * float(price)
 
         self._profiles[symbol][price_level] += base_volume
         
@@ -102,80 +103,10 @@ class VolumeProfileCalculator:
         *,
         percentage: float | None = None,
     ) -> tuple[float | None, float | None, float | None]:
-        """Calculate POC/VAH/VAL for a volume profile.
-
-        Note: some call-sites (older versions) used the kwarg name `percentage`.
-        We accept both `value_area_percent` and `percentage` for backward
-        compatibility.
-        """
+        """Calculate POC/VAH/VAL for a volume profile."""
         if percentage is not None:
             value_area_percent = float(percentage)
-        if not profile:
-            return None, None, None
-
-        sorted_prices = sorted(profile.keys())
-        if len(sorted_prices) == 1:
-            price = sorted_prices[0]
-            return price, price, price
-
-        total_volume = float(sum(profile.values()))
-        if total_volume <= 0:
-            return None, None, None
-
-        target_volume = total_volume * (value_area_percent / 100.0)
-
-        # POC (tie-break towards midpoint of the full range)
-        mid_price = (sorted_prices[0] + sorted_prices[-1]) / 2.0
-        poc = self.calculate_poc(profile, mid_price)
-        if poc is None:
-            return None, None, None
-
-        # Index of POC within sorted prices
-        try:
-            poc_idx = sorted_prices.index(poc)
-        except ValueError:
-            # If rounding differences occur, pick nearest price level.
-            poc = min(sorted_prices, key=lambda p: abs(p - poc))
-            poc_idx = sorted_prices.index(poc)
-
-        vah_idx = poc_idx
-        val_idx = poc_idx
-        current_volume = float(profile[poc])
-
-        while current_volume < target_volume and (vah_idx + 1 < len(sorted_prices) or val_idx - 1 >= 0):
-            up_idx = vah_idx + 1
-            down_idx = val_idx - 1
-
-            up_vol = float(profile.get(sorted_prices[up_idx], 0.0)) if up_idx < len(sorted_prices) else -1.0
-            down_vol = float(profile.get(sorted_prices[down_idx], 0.0)) if down_idx >= 0 else -1.0
-
-            # No more volume to add
-            if up_vol <= 0 and down_vol <= 0:
-                break
-
-            if up_vol > down_vol:
-                vah_idx = up_idx
-                current_volume += up_vol
-            elif down_vol > up_vol:
-                val_idx = down_idx
-                current_volume += down_vol
-            else:
-                # Equal: include both sides when possible (avoid double counting same index)
-                added = False
-                if up_idx < len(sorted_prices):
-                    vah_idx = up_idx
-                    current_volume += up_vol
-                    added = True
-                if down_idx >= 0 and down_idx != up_idx:
-                    val_idx = down_idx
-                    current_volume += down_vol
-                    added = True
-                if not added:
-                    break
-
-        vah = sorted_prices[vah_idx]
-        val = sorted_prices[val_idx]
-        return poc, vah, val
+        return ValueAreaCalculator.compute(profile, value_area_percent)
 
     def build_volume_profile(self, rows: list[dict[str, Any]]) -> dict[float, float]:
         """Build a base-volume profile from storage rows.
@@ -192,11 +123,14 @@ class VolumeProfileCalculator:
             buy_v = float(r.get("buy_volume") or 0.0)
             sell_v = float(r.get("sell_volume") or 0.0)
             total_v = float(r.get("total_volume") or r.get("volume") or 0.0)
+            notional = float(r.get("notional") or 0.0)
 
-            # Prefer buy+sell if provided, otherwise fall back to total/volume.
-            base_v = buy_v + sell_v
+            # Prefer explicit notional; otherwise multiply base volume by price level.
+            base_v = notional if notional > 0 else (buy_v + sell_v)
             if base_v <= 0 and total_v > 0:
-                base_v = total_v
+                base_v = total_v * price
+            elif base_v <= 0:
+                base_v = (buy_v + sell_v) * price
 
             if base_v == 0:
                 continue

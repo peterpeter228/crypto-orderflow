@@ -15,6 +15,7 @@ from src.binance.rest_client import BinanceRestClient
 from src.indicators import (
     VWAPCalculator,
     VolumeProfileCalculator,
+    VolumeProfileEngine,
     SessionLevelsCalculator,
     FootprintCalculator,
     DeltaCVDCalculator,
@@ -45,6 +46,7 @@ class MCPTools:
         imbalance: ImbalanceDetector,
         depth_delta: DepthDeltaCalculator,
         heatmap: OrderbookHeatmapSampler | None = None,
+        profile_engine: VolumeProfileEngine | None = None,
     ):
         self.settings = get_settings()
         self.cache = cache
@@ -60,6 +62,7 @@ class MCPTools:
         self.imbalance = imbalance
         self.depth_delta = depth_delta
         self.heatmap = heatmap
+        self.profile_engine = profile_engine
         self.logger = get_logger("mcp.tools")
         # Data quality thresholds (tunable)
         self.coverage_threshold = 0.8
@@ -67,6 +70,14 @@ class MCPTools:
         self.min_levels = 20
         # On-demand backfill can be toggled in tests to avoid network calls.
         self.on_demand_backfill_enabled = True
+
+        if self.profile_engine is None:
+            self.profile_engine = VolumeProfileEngine(
+                storage=self.storage,
+                cache=self.cache,
+                backfill_callback=self._maybe_backfill_footprint,
+                coverage_threshold=self.coverage_threshold,
+            )
 
     def _build_data_quality(
         self,
@@ -291,6 +302,11 @@ class MCPTools:
         symbol: str,
         date: str | None = None,
         session_tz: str = "UTC",
+        *,
+        bin_size: float | None = None,
+        value_area_pct: float = 70.0,
+        mode: str = "raw",
+        normalize_seconds: int = 3,
     ) -> dict[str, Any]:
         """Get key price levels for trading analysis.
 
@@ -317,8 +333,53 @@ class MCPTools:
         # Get VWAP levels
         vwap_levels = await self.vwap.get_key_levels(symbol, date=ref_day_start)
 
-        # Get Volume Profile levels
-        vp_levels = await self.volume_profile.get_key_levels(symbol, date=ref_day_start)
+        # Volume Profile (aligned with profile engine / Exocharts binning)
+        bin_sz = float(bin_size or self.settings.get_tpo_tick_size(symbol))
+        va_pct = float(value_area_pct)
+        day_start_ms = ref_day_start or get_day_start_ms(now)
+        day_end_ms = day_start_ms + 86_400_000
+        prev_day_start = day_start_ms - 86_400_000
+
+        dev_profile = await self.profile_engine.build_profile(
+            symbol,
+            window_start_ms=day_start_ms,
+            window_end_ms=day_end_ms if is_current_day else day_end_ms,
+            bin_size=bin_sz,
+            value_area_pct=va_pct,
+            mode=mode,
+            normalize_seconds=normalize_seconds,
+            include_levels=False,
+        )
+        prev_profile = await self.profile_engine.build_profile(
+            symbol,
+            window_start_ms=prev_day_start,
+            window_end_ms=day_start_ms,
+            bin_size=bin_sz,
+            value_area_pct=va_pct,
+            mode=mode,
+            normalize_seconds=normalize_seconds,
+            include_levels=False,
+        )
+
+        def _profile_to_dict(p: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "POC": (p.get("valueArea") or {}).get("vPOC"),
+                "VAH": (p.get("valueArea") or {}).get("VAH"),
+                "VAL": (p.get("valueArea") or {}).get("VAL"),
+                "high": None,
+                "low": None,
+                "totalVolume": (p.get("totals") or {}).get("totalVolume"),
+                "priceLevels": (p.get("totals") or {}).get("binCount"),
+                "coverage": p.get("dataQuality") or {},
+                "window": p.get("window"),
+                "binSize": (p.get("window") or {}).get("binSize"),
+                "valueAreaPct": p.get("valueAreaPct"),
+            }
+
+        vp_levels = {
+            "developing": _profile_to_dict(dev_profile),
+            "previousDay": _profile_to_dict(prev_profile),
+        }
 
         # Get Session levels
         # NOTE: SessionLevelsCalculator.get_key_levels() accepts `date` (ms day_start), not `date_ms`.
@@ -368,35 +429,16 @@ class MCPTools:
             flat[f"{l_key}_y"] = y_sess.get(l_key)
 
         # Data quality gating for VP-based levels
-        day_start_ms = ref_day_start or get_day_start_ms(now)
-        day_end_ms = day_start_ms + 86_400_000
-        prev_day_start = day_start_ms - 86_400_000
-
         dev_cov = developing.get("coverage") or {}
         prev_cov = previous.get("coverage") or {}
 
-        dq_developing = self._build_data_quality(
-            window_start_ms=day_start_ms,
-            window_end_ms=day_end_ms if (vwap_levels or {}).get("isCurrentDay", True) else now,
-            coverage_raw=dev_cov,
-            bars_returned=None,
-            levels_count=developing.get("priceLevels"),
-            source="footprint_1m",
-        )
-        dq_previous = self._build_data_quality(
-            window_start_ms=prev_day_start,
-            window_end_ms=day_start_ms,
-            coverage_raw=prev_cov,
-            bars_returned=None,
-            levels_count=previous.get("priceLevels"),
-            source="footprint_1m",
-            reasons_prefix=[] if previous.get("complete", False) else ["previous_day_incomplete"],
-        )
+        dev_degraded = (dev_cov.get("coveragePct", 0.0) < self.coverage_threshold) and not dev_cov.get("dayIncomplete")
+        prev_degraded = (prev_cov.get("coveragePct", 0.0) < self.coverage_threshold)
 
-        if dq_developing["degraded"]:
+        if dev_degraded:
             for key in ("dPOC", "dVAH", "dVAL", "dVWAP"):
                 flat[key] = None
-        if dq_previous["degraded"]:
+        if prev_degraded:
             for key in ("pdPOC", "pdVAH", "pdVAL", "pdVWAP"):
                 flat[key] = None
 
@@ -425,11 +467,17 @@ class MCPTools:
             "sessions": session_levels,
             "unit": "USDT",
             "dataQuality": {
-                "developing": dq_developing,
-                "previousDay": dq_previous,
+                "developing": dev_cov,
+                "previousDay": prev_cov,
             },
             "sessionWindows": session_windows,
             "sessionTZ": session_tz or "UTC",
+            "profileParams": {
+                "binSize": bin_sz,
+                "valueAreaPct": float(va_pct if va_pct <= 1 else va_pct / 100.0),
+                "mode": mode,
+                "normalizeSeconds": int(normalize_seconds),
+            },
         }
 
     async def get_session_profile(
@@ -441,6 +489,11 @@ class MCPTools:
         value_area_percent: float = 70.0,
         include_profile_levels: bool = False,
         max_profile_levels: int = 400,
+        bin_size: float | None = None,
+        mode: str = "raw",
+        normalize_seconds: int = 3,
+        window_start_ms: int | None = None,
+        window_end_ms: int | None = None,
     ) -> dict[str, Any]:
         """Session profile(s): OHLC, Vol/Delta (quote), vPOC/vVAH/vVAL, and session VWAP.
 
@@ -477,6 +530,96 @@ class MCPTools:
         if session != "all" and session not in session_map:
             known = ", ".join([s.name for s in session_defs]) or "(none)"
             raise ValueError(f"Unknown session '{session}'. Known sessions: {known}, all")
+
+        bin_sz = float(bin_size or self.settings.get_tpo_tick_size(symbol))
+        # Visible Range override
+        if window_start_ms is not None and window_end_ms is not None:
+            start_ms = int(window_start_ms)
+            end_ms = int(window_end_ms)
+            if end_ms <= start_ms:
+                raise ValueError("window_end_ms must be greater than window_start_ms")
+            effective_end = min(end_ms, now)
+            kline_data = []
+            try:
+                kline_data = await self.rest_client.get_klines(
+                    symbol=symbol,
+                    interval=interval,
+                    start_time=start_ms,
+                    end_time=effective_end,
+                    limit=1500,
+                )
+            except Exception:
+                kline_data = []
+            k_quote = float(sum(k.quote_volume for k in kline_data)) if kline_data else 0.0
+            k_base = float(sum(k.volume for k in kline_data)) if kline_data else 0.0
+            k_delta = (
+                float(sum((2.0 * k.taker_buy_quote_volume - k.quote_volume) for k in kline_data))
+                if kline_data
+                else 0.0
+            )
+            k_vwap = (k_quote / k_base) if k_base > 0 else None
+            profile_res = await self.profile_engine.build_profile(
+                symbol,
+                window_start_ms=start_ms,
+                window_end_ms=effective_end,
+                bin_size=bin_sz,
+                value_area_pct=value_area_percent,
+                mode=mode,
+                normalize_seconds=normalize_seconds,
+                include_levels=include_profile_levels,
+                top_n_levels=max_profile_levels if include_profile_levels else None,
+                price_level_limit=max_profile_levels if include_profile_levels else None,
+            )
+            name = session if session != "all" else "custom"
+            return {
+                "symbol": symbol,
+                "timestamp": now,
+                "sessionTZ": "UTC",
+                "date": datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d"),
+                "sessions": {
+                    name: {
+                        "name": name,
+                        "status": "window",
+                        "range": {"startTime": start_ms, "endTime": end_ms, "effectiveEndTime": effective_end},
+                        "ohlc": {
+                            "open": kline_data[0].open if kline_data else None,
+                            "high": max((k.high for k in kline_data), default=None),
+                            "low": min((k.low for k in kline_data), default=None),
+                            "close": kline_data[-1].close if kline_data else None,
+                        },
+                        "volQuote": (profile_res.get("totals") or {}).get("totalVolume") or k_quote,
+                        "deltaQuote": k_delta,
+                        "deltaPercent": (k_delta / k_quote * 100.0) if k_quote else 0.0,
+                        "vwap": (k_quote / k_base) if k_base > 0 else k_vwap,
+                        "sources": {
+                            "totals": "footprint_1m" if (profile_res.get("totals") or {}).get("totalVolume") else "binance_klines",
+                            "profile": "footprint_1m" if (profile_res.get("totals") or {}).get("totalVolume") else None,
+                        },
+                        "profile": {
+                            "mode": mode,
+                            "available": True,
+                            "valueAreaPercent": value_area_percent,
+                            "vPOC": (profile_res.get("valueArea") or {}).get("vPOC"),
+                            "vVAH": (profile_res.get("valueArea") or {}).get("VAH"),
+                            "vVAL": (profile_res.get("valueArea") or {}).get("VAL"),
+                            "volumeQuote": (profile_res.get("totals") or {}).get("totalVolume"),
+                            "levels": profile_res.get("levels") if include_profile_levels else None,
+                            "binSize": bin_sz,
+                            "degraded": (profile_res.get("dataQuality") or {}).get("coveragePct", 0) < self.coverage_threshold
+                            and not (profile_res.get("dataQuality") or {}).get("dayIncomplete"),
+                        },
+                        "dataQuality": profile_res.get("dataQuality"),
+                    }
+                },
+                "unit": "USDT",
+                "sessionWindows": [{"name": name, "startTime": start_ms, "endTime": end_ms, "timezone": "UTC"}],
+                "profileParams": {
+                    "binSize": bin_sz,
+                    "valueAreaPct": float(value_area_percent if value_area_percent <= 1 else value_area_percent / 100.0),
+                    "mode": mode,
+                    "normalizeSeconds": int(normalize_seconds),
+                },
+            }
 
         requested_defs = list(session_defs) if session == "all" else [session_map[session]]
 
@@ -575,80 +718,32 @@ class MCPTools:
                     rf = flips
 
                 # -----------------------------
-                # Footprint-based profile + totals (preferred)
+                # Unified profile engine (VR/Session-aligned)
                 # -----------------------------
-                profile_rows = []
-                try:
-                    profile_rows = await self.storage.get_profile_range(symbol, start_ms, effective_end)
-                except Exception:
-                    profile_rows = []
-
-                quote_profile: dict[float, float] = {}
-                buy_quote = 0.0
-                sell_quote = 0.0
-                base_total = 0.0
-                trade_count = 0
-
-                for r in profile_rows:
-                    pl = float(r["price_level"])
-                    bv = float(r.get("buy_volume", 0.0) or 0.0)
-                    sv = float(r.get("sell_volume", 0.0) or 0.0)
-                    tv = bv + sv
-
-                    trade_count += int(r.get("trade_count", 0) or 0)
-                    base_total += tv
-                    buy_quote += bv * pl
-                    sell_quote += sv * pl
-                    quote_profile[pl] = quote_profile.get(pl, 0.0) + tv * pl
-
-                profile_available = bool(quote_profile)
-                fp_quote = float(sum(quote_profile.values())) if quote_profile else 0.0
-                fp_delta = float(buy_quote - sell_quote)
-                fp_vwap = (fp_quote / base_total) if base_total > 0 else None
-
-                v_poc = v_vah = v_val = None
-                if quote_profile:
-                    v_poc, v_vah, v_val = self.volume_profile.calculate_value_area(
-                        quote_profile, value_area_percent=value_area_percent
-                    )
-
-                profile_levels = None
-                if include_profile_levels and quote_profile:
-                    # Return a capped number of levels around the POC if possible,
-                    # otherwise return the top-N by volume.
-                    items = sorted(quote_profile.items(), key=lambda x: x[0])
-                    if v_poc is not None:
-                        prices = [p for p, _ in items]
-                        try:
-                            poc_idx = prices.index(v_poc)
-                        except ValueError:
-                            poc_idx = len(prices) // 2
-                        half = max_profile_levels // 2
-                        lo_i = max(0, poc_idx - half)
-                        hi_i = min(len(items), poc_idx + half + 1)
-                        window = items[lo_i:hi_i]
-                    else:
-                        window = sorted(items, key=lambda x: x[1], reverse=True)[:max_profile_levels]
-                        window = sorted(window, key=lambda x: x[0])
-                    profile_levels = [{"price": float(p), "volumeQuote": float(v)} for p, v in window]
-
-                cov_raw = await self.storage.get_footprint_coverage(symbol, start_ms, effective_end)
-                dq = self._build_data_quality(
+                profile_result = await self.profile_engine.build_profile(
+                    symbol,
                     window_start_ms=start_ms,
                     window_end_ms=effective_end,
-                    coverage_raw=cov_raw,
-                    bars_returned=len(klines),
-                    levels_count=len(quote_profile),
-                    source="footprint_1m" if profile_available else "binance_klines",
+                    bin_size=bin_sz,
+                    value_area_pct=value_area_percent,
+                    mode=mode,
+                    normalize_seconds=normalize_seconds,
+                    include_levels=include_profile_levels,
+                    top_n_levels=max_profile_levels if include_profile_levels else None,
+                    price_level_limit=max_profile_levels if include_profile_levels else None,
                 )
-                if dq["degraded"]:
-                    v_poc = v_vah = v_val = None
-                    profile_available = False
 
-                # Prefer footprint totals when available (closer to Exocharts).
-                vol_quote = fp_quote if profile_available else k_quote
-                delta_quote = fp_delta if profile_available else k_delta
-                vwap = fp_vwap if profile_available else k_vwap
+                profile_levels = profile_result.get("levels") if include_profile_levels else None
+                dq = profile_result.get("dataQuality") or {}
+                profile_available = (profile_result.get("totals") or {}).get("totalVolume", 0) > 0
+
+                v_poc = (profile_result.get("valueArea") or {}).get("vPOC")
+                v_vah = (profile_result.get("valueArea") or {}).get("VAH")
+                v_val = (profile_result.get("valueArea") or {}).get("VAL")
+
+                vol_quote = (profile_result.get("totals") or {}).get("totalVolume") or k_quote
+                delta_quote = k_delta  # delta at profile granularity is not retained in compressed output
+                vwap = (vol_quote / k_base) if profile_available and k_base > 0 else k_vwap
                 totals_source = "footprint_1m" if profile_available else "binance_klines"
 
                 out[name] = {
@@ -900,6 +995,14 @@ class MCPTools:
         timeframe: str = "30m",
         view: str = "statistics",
         max_levels_per_bar: int = 200,
+        *,
+        bin_size: float | None = None,
+        tick_size: float | None = None,
+        price_level_limit: int | None = None,
+        top_n_levels: int | None = None,
+        compress: bool = True,
+        cursor: int | None = None,
+        limit: int | None = None,
     ) -> dict[str, Any]:
         """Get footprint information.
 
@@ -943,14 +1046,70 @@ class MCPTools:
 
         data = await self.footprint.get_footprint_range(symbol, start_time, end_time, timeframe=timeframe)
 
-        # Safety: truncate levels per bar to avoid giant payloads
-        truncated = False
+        bin_sz = None
+        if bin_size is not None:
+            bin_sz = float(bin_size)
+        elif tick_size is not None:
+            bin_sz = float(tick_size)
+
+        price_cap = price_level_limit or max_levels_per_bar
+        bars_out: list[dict[str, Any]] = []
+        truncated_any = False
+
         for bar in data:
-            levels = bar.get("levels") or []
-            if len(levels) > max_levels_per_bar:
-                bar["levels"] = levels[:max_levels_per_bar]
-                bar["levels_truncated"] = True
-                truncated = True
+            levels = list(bar.get("levels") or [])
+            if bin_sz and bin_sz > 0:
+                agg: dict[float, dict[str, float]] = {}
+                for lvl in levels:
+                    price = float(lvl.get("price"))
+                    bucket = (int(price // bin_sz)) * bin_sz
+                    if bucket not in agg:
+                        agg[bucket] = {
+                            "buy": 0.0,
+                            "sell": 0.0,
+                            "trades": 0,
+                        }
+                    agg[bucket]["buy"] += float(lvl.get("buyVolume", 0.0))
+                    agg[bucket]["sell"] += float(lvl.get("sellVolume", 0.0))
+                    agg[bucket]["trades"] += int(lvl.get("tradeCount", 0))
+                levels = [
+                    {
+                        "price": p,
+                        "buyVolume": v["buy"],
+                        "sellVolume": v["sell"],
+                        "tradeCount": v["trades"],
+                        "delta": v["buy"] - v["sell"],
+                        "totalVolume": v["buy"] + v["sell"],
+                    }
+                    for p, v in sorted(agg.items())
+                ]
+
+            if compress:
+                total_levels = len(levels)
+                if top_n_levels is not None and total_levels > top_n_levels:
+                    levels = sorted(levels, key=lambda l: l.get("totalVolume", 0.0), reverse=True)[: int(top_n_levels)]
+                if price_cap and len(levels) > price_cap:
+                    levels = levels[:price_cap]
+                dropped = total_levels - len(levels)
+                bar["levelsDropped"] = max(0, dropped)
+                truncated_any = truncated_any or dropped > 0
+            else:
+                if price_cap and len(levels) > price_cap:
+                    levels = levels[:price_cap]
+                    bar["levels_truncated"] = True
+                    truncated_any = True
+
+            bar["levels"] = levels
+            bars_out.append(bar)
+
+        start_idx = int(cursor or 0)
+        if start_idx < 0:
+            start_idx = 0
+        end_idx = start_idx + limit if limit is not None else None
+        paged = bars_out[start_idx:end_idx]
+        next_cursor = None
+        if end_idx is not None and end_idx < len(bars_out):
+            next_cursor = end_idx
 
         return {
             "symbol": symbol,
@@ -958,14 +1117,19 @@ class MCPTools:
             "startTime": start_time,
             "endTime": end_time,
             "view": "levels",
-            "levelsTruncated": truncated,
-            "bars": data,
+            "levelsTruncated": truncated_any,
+            "cursor": start_idx,
+            "nextCursor": next_cursor,
+            "bars": paged,
+            "binSize": bin_sz,
+            "topNLevels": top_n_levels,
+            "levelLimit": price_cap,
             "dataQuality": self._build_data_quality(
                 window_start_ms=start_time,
                 window_end_ms=end_time,
                 coverage_raw=cov_raw,
-                bars_returned=len(data),
-                levels_count=sum(len((b.get("levels") or [])) for b in data),
+                bars_returned=len(bars_out),
+                levels_count=sum(len((b.get("levels") or [])) for b in bars_out),
                 source="local",
             ),
         }
@@ -1217,6 +1381,7 @@ class MCPTools:
                 "enabled": False,
                 "message": "Heatmap is disabled. Set HEATMAP_ENABLED=true to enable sampling.",
                 "howToEnable": "Set HEATMAP_ENABLED=true and restart the MCP server.",
+                "remediation": "Enable HEATMAP_ENABLED and allow sampler to warm up for the requested lookback window.",
                 "dataQuality": {
                     "isEnabled": False,
                     "degraded": True,
@@ -1282,6 +1447,11 @@ class MCPTools:
             "midPrice": mid,
             "coverage": coverage,
             "dataQuality": dq,
+            "remediation": (
+                "Wait for new snapshots or reduce lookbackMinutes to fit collected window."
+                if dq["degraded"]
+                else None
+            ),
             "topBidBins": [
                 {
                     "priceBin": float(r["price_bin"]),

@@ -18,6 +18,7 @@ from typing import Any
 
 from src.data.storage import DataStorage
 from src.utils import get_logger
+from .profile_engine import ValueAreaCalculator
 
 
 @dataclass
@@ -62,75 +63,16 @@ class TPOProfileCalculator:
         percentage: float = 70.0,
         poc: float | None = None,
     ) -> tuple[float | None, float | None, float | None]:
-        """Calculate (POC, VAH, VAL) by expanding from POC until target % is reached.
-
-        This matches the standard profile-style VA expansion used in many platforms.
-        """
+        """Calculate (POC, VAH, VAL) using shared ValueAreaCalculator."""
+        # ValueAreaCalculator computes poc internally; retain legacy poc override for compatibility.
+        if poc is not None and poc not in profile:
+            poc = None
+        if poc is None:
+            return ValueAreaCalculator.compute(profile, percentage)
         if not profile:
             return None, None, None
-
-        total = float(sum(profile.values()))
-        if total <= 0:
-            return None, None, None
-
-        target = total * (float(percentage) / 100.0)
-
-        sorted_prices = sorted(profile.keys())
-        if poc is None:
-            mid = (sorted_prices[0] + sorted_prices[-1]) / 2.0
-            poc = cls.calculate_poc(profile, mid)
-        if poc is None:
-            return None, None, None
-
-        # If POC is not an exact key (should not happen), snap to nearest.
-        if poc not in profile:
-            poc = min(sorted_prices, key=lambda p: abs(p - poc))
-
-        poc_idx = sorted_prices.index(poc)
-        vah_idx = poc_idx
-        val_idx = poc_idx
-        current = float(profile[poc])
-
-        while current < target:
-            upper_val = profile.get(sorted_prices[vah_idx + 1], 0.0) if vah_idx + 1 < len(sorted_prices) else 0.0
-            lower_val = profile.get(sorted_prices[val_idx - 1], 0.0) if val_idx > 0 else 0.0
-
-            if upper_val == 0 and lower_val == 0:
-                break
-
-            # Prefer expanding toward the side with more volume.
-            # If both sides are equal, expand both sides (matches common TPO/VP VA logic).
-            can_up = vah_idx + 1 < len(sorted_prices)
-            can_down = val_idx > 0
-
-            if can_up and (not can_down or upper_val > lower_val):
-                vah_idx += 1
-                current += float(profile[sorted_prices[vah_idx]])
-            elif can_down and (not can_up or lower_val > upper_val):
-                val_idx -= 1
-                current += float(profile[sorted_prices[val_idx]])
-            elif can_up and can_down and upper_val == lower_val:
-                # Add both sides, but avoid double-counting if indices meet.
-                if vah_idx + 1 == val_idx - 1:
-                    vah_idx += 1
-                    current += float(profile[sorted_prices[vah_idx]])
-                else:
-                    vah_idx += 1
-                    current += float(profile[sorted_prices[vah_idx]])
-                    val_idx -= 1
-                    current += float(profile[sorted_prices[val_idx]])
-            elif can_up:
-                vah_idx += 1
-                current += float(profile[sorted_prices[vah_idx]])
-            elif can_down:
-                val_idx -= 1
-                current += float(profile[sorted_prices[val_idx]])
-            else:
-                break
-
-        vah = sorted_prices[vah_idx]
-        val = sorted_prices[val_idx]
-        return poc, vah, val
+        temp = dict(profile)
+        return ValueAreaCalculator.compute(temp, percentage)
 
     async def build_period_profiles(
         self,

@@ -212,6 +212,23 @@ Transport: HTTP
 }
 ```
 
+### VR / Session Profile（Exocharts 对齐）
+- **复现窗口**：显式传入 `windowStartMs` / `windowEndMs`（毫秒）与 `binSize`（即 Exocharts 的 `T:70/80` 价格分箱）。
+- **Value Area**：`valueAreaPercent` 默认 70%，围绕 vPOC 逐步向两侧扩张直到累计成交额覆盖目标比例。
+- **模式**：`mode=raw`（默认）或 `mode=synthetic`（配合 `normalizeSeconds=3` 近似 Exocharts 的 3s Normalized 数据）。
+- **输出元数据**：返回 `window`、`binSize`、`valueAreaPct`、`dataQuality.coveragePct/missingRanges/algoVersion`，用于与 Exocharts 结果对比。
+
+### Footprint Levels 控制
+- `view="levels"` 时，可通过以下参数减小负载：
+  - `binSize`/`tickSize`：价格重新分箱
+  - `topNLevels` / `priceLevelLimit`：只返回成交额最高的价位
+  - `compress=true`（默认）：返回压缩后的价位并带 `levelsDropped`
+  - `cursor` + `limit`：分页返回 bars，避免一次性巨大 payload
+
+### Heatmap 启用/诊断
+- 环境变量 `HEATMAP_ENABLED=true` 后生效；返回体会包含 `enabled`、`remediation`、覆盖窗口与最新更新时间。
+- 若未启用或数据过少，`dataQuality.degraded=true` 并给出修复提示。
+
 ### get_swing_liquidity
 获取 Swing Liquidity（Swing High/Low 的流动性价位）：
 - Pivot swing highs => buy-side liquidity（上方止损/流动性）

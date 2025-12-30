@@ -9,10 +9,13 @@ from .imbalance import ImbalanceDetector
 from .depth_delta import DepthDeltaCalculator
 from .orderbook_heatmap import OrderbookHeatmapSampler
 from .tpo_profile import TPOProfileCalculator
+from .profile_engine import VolumeProfileEngine, ValueAreaCalculator
 
 __all__ = [
     "VWAPCalculator",
     "VolumeProfileCalculator",
+    "VolumeProfileEngine",
+    "ValueAreaCalculator",
     "SessionLevelsCalculator",
     "FootprintCalculator",
     "DeltaCVDCalculator",
