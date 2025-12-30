@@ -254,6 +254,9 @@ class Settings(BaseSettings):
     # If true, delete existing cached aggregates for the selected backfill days and rebuild from Binance.
     # If false (recommended), only missing days will be backfilled.
     backfill_rebuild: bool = Field(default=False)
+    # Upper bound for how long we will block FastAPI startup while running backfill.
+    # Set to 0 to disable the guard. Helps avoid being stuck on repeated 429s when BACKFILL_BLOCK_STARTUP=true.
+    backfill_block_startup_timeout_ms: int = Field(default=300_000)
 
     # When using startTime+endTime on Binance aggTrades, the window must be <= 1 hour.
     # We chunk the backfill range into windows of this size (minutes). Max 60.

@@ -38,6 +38,9 @@ async def test_get_orderflow_metrics_current_cvd_from_sequence():
     )
     footprint.get_footprint_range = AsyncMock(return_value=[])
     imbalance.analyze_footprint = MagicMock(return_value=None)
+    storage.get_footprint_coverage = AsyncMock(
+        return_value={"minute_buckets": 1, "min_ts": 0, "max_ts": 0}
+    )
 
     tools = MCPTools(
         cache=cache,

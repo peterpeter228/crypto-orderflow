@@ -9,6 +9,7 @@ from src.config import get_settings
 
 from src.data.cache import MemoryCache
 from src.data.storage import DataStorage
+from src.data.backfill import AggTradesBackfiller
 from src.data.orderbook import OrderbookManager
 from src.binance.rest_client import BinanceRestClient
 from src.indicators import (
@@ -60,6 +61,123 @@ class MCPTools:
         self.depth_delta = depth_delta
         self.heatmap = heatmap
         self.logger = get_logger("mcp.tools")
+        # Data quality thresholds (tunable)
+        self.coverage_threshold = 0.8
+        self.min_bars = 20
+        self.min_levels = 20
+        # On-demand backfill can be toggled in tests to avoid network calls.
+        self.on_demand_backfill_enabled = True
+
+    def _build_data_quality(
+        self,
+        *,
+        window_start_ms: int,
+        window_end_ms: int,
+        coverage_raw: dict[str, Any] | None,
+        bars_returned: int | None,
+        levels_count: int | None = None,
+        source: str = "local",
+        reasons_prefix: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Construct a normalized data quality block."""
+        expected_minutes = max(1, int((window_end_ms - window_start_ms) / 60_000))
+        raw_buckets = coverage_raw or {}
+        minute_buckets = int(
+            raw_buckets.get("minute_buckets")
+            or raw_buckets.get("minuteBuckets")
+            or 0
+        )
+        min_ts = raw_buckets.get("min_ts") or raw_buckets.get("minTs")
+        max_ts = raw_buckets.get("max_ts") or raw_buckets.get("maxTs")
+        coverage_pct = float(minute_buckets / expected_minutes) if expected_minutes else 0.0
+
+        reasons: list[str] = []
+        if reasons_prefix:
+            reasons.extend(reasons_prefix)
+        if coverage_pct < self.coverage_threshold:
+            reasons.append("low_coverage")
+        if bars_returned is not None and bars_returned < self.min_bars:
+            reasons.append("insufficient_bars")
+        if levels_count is not None and levels_count < self.min_levels:
+            reasons.append("insufficient_levels")
+
+        degraded = bool(reasons)
+        missing_minutes = max(0, expected_minutes - minute_buckets)
+        remediation = None
+        if degraded and coverage_pct < self.coverage_threshold:
+            remediation = (
+                f"Backfill ~{round(missing_minutes / 60, 2)}h of footprint_1m "
+                f"between {window_start_ms} and {window_end_ms}"
+            )
+
+        return {
+            "windowStartMs": window_start_ms,
+            "windowEndMs": window_end_ms,
+            "expectedMinutes": expected_minutes,
+            "barsReturned": bars_returned,
+            "coveragePct": round(coverage_pct, 4),
+            "minuteBuckets": minute_buckets,
+            "levelsCount": levels_count,
+            "minTimestamp": min_ts,
+            "maxTimestamp": max_ts,
+            "source": source,
+            "degraded": degraded,
+            "reasons": reasons,
+            "remediation": remediation,
+        }
+
+    async def _maybe_backfill_footprint(
+        self,
+        symbol: str,
+        start_ms: int,
+        end_ms: int,
+        *,
+        coverage_pct: float,
+    ) -> bool:
+        """Attempt a limited on-demand backfill when coverage is poor."""
+        if (
+            not self.on_demand_backfill_enabled
+            or not getattr(self.settings, "backfill_enabled", False)
+        ):
+            return False
+        if coverage_pct >= self.coverage_threshold:
+            return False
+
+        span_ms = max(0, end_ms - start_ms)
+        # Avoid overly large backfills from interactive calls.
+        max_span_ms = int(12 * 3_600_000)
+        if span_ms > max_span_ms:
+            start_ms = end_ms - max_span_ms
+
+        try:
+            backfiller = AggTradesBackfiller(self.rest_client, self.storage)
+            max_requests = (
+                self.settings.backfill_max_requests_per_symbol
+                if getattr(self.settings, "backfill_max_requests_per_symbol", 0) > 0
+                else None
+            )
+            await backfiller.backfill_symbol_range(
+                symbol=symbol,
+                start_time=start_ms,
+                end_time=end_ms,
+                clear_days=False,
+                pause_ms=getattr(self.settings, "backfill_request_pause_ms", 250),
+                max_requests=max_requests,
+            )
+            try:
+                await backfiller.close()
+            except Exception:
+                pass
+            return True
+        except Exception as exc:  # pragma: no cover - defensive
+            self.logger.warning(
+                "on_demand_backfill_failed",
+                symbol=symbol,
+                error=str(exc),
+                start_ms=start_ms,
+                end_ms=end_ms,
+            )
+            return False
 
     def _get_tpo_tick_size_safe(self, symbol: str) -> float:
         """Get TPO tick size with fallbacks for missing settings fields."""
@@ -249,6 +367,54 @@ class MCPTools:
             flat[f"{h_key}_y"] = y_sess.get(h_key)
             flat[f"{l_key}_y"] = y_sess.get(l_key)
 
+        # Data quality gating for VP-based levels
+        day_start_ms = ref_day_start or get_day_start_ms(now)
+        day_end_ms = day_start_ms + 86_400_000
+        prev_day_start = day_start_ms - 86_400_000
+
+        dev_cov = developing.get("coverage") or {}
+        prev_cov = previous.get("coverage") or {}
+
+        dq_developing = self._build_data_quality(
+            window_start_ms=day_start_ms,
+            window_end_ms=day_end_ms if (vwap_levels or {}).get("isCurrentDay", True) else now,
+            coverage_raw=dev_cov,
+            bars_returned=None,
+            levels_count=developing.get("priceLevels"),
+            source="footprint_1m",
+        )
+        dq_previous = self._build_data_quality(
+            window_start_ms=prev_day_start,
+            window_end_ms=day_start_ms,
+            coverage_raw=prev_cov,
+            bars_returned=None,
+            levels_count=previous.get("priceLevels"),
+            source="footprint_1m",
+            reasons_prefix=[] if previous.get("complete", False) else ["previous_day_incomplete"],
+        )
+
+        if dq_developing["degraded"]:
+            for key in ("dPOC", "dVAH", "dVAL", "dVWAP"):
+                flat[key] = None
+        if dq_previous["degraded"]:
+            for key in ("pdPOC", "pdVAH", "pdVAL", "pdVWAP"):
+                flat[key] = None
+
+        session_windows = []
+        for sdef in self.settings.session_defs:
+            start_ms = day_start_ms + int(sdef.start_minutes) * 60_000
+            end_ms = day_start_ms + int(sdef.end_minutes) * 60_000
+            if sdef.end_minutes <= sdef.start_minutes:
+                end_ms += 86_400_000
+            session_windows.append(
+                {
+                    "name": sdef.name,
+                    "startTime": start_ms,
+                    "endTime": end_ms,
+                    "timezone": session_tz or "UTC",
+                }
+            )
+
         return {
             "symbol": symbol,
             "timestamp": now,
@@ -258,6 +424,12 @@ class MCPTools:
             "volumeProfile": vp_levels,
             "sessions": session_levels,
             "unit": "USDT",
+            "dataQuality": {
+                "developing": dq_developing,
+                "previousDay": dq_previous,
+            },
+            "sessionWindows": session_windows,
+            "sessionTZ": session_tz or "UTC",
         }
 
     async def get_session_profile(
@@ -460,6 +632,19 @@ class MCPTools:
                         window = sorted(window, key=lambda x: x[0])
                     profile_levels = [{"price": float(p), "volumeQuote": float(v)} for p, v in window]
 
+                cov_raw = await self.storage.get_footprint_coverage(symbol, start_ms, effective_end)
+                dq = self._build_data_quality(
+                    window_start_ms=start_ms,
+                    window_end_ms=effective_end,
+                    coverage_raw=cov_raw,
+                    bars_returned=len(klines),
+                    levels_count=len(quote_profile),
+                    source="footprint_1m" if profile_available else "binance_klines",
+                )
+                if dq["degraded"]:
+                    v_poc = v_vah = v_val = None
+                    profile_available = False
+
                 # Prefer footprint totals when available (closer to Exocharts).
                 vol_quote = fp_quote if profile_available else k_quote
                 delta_quote = fp_delta if profile_available else k_delta
@@ -500,8 +685,10 @@ class MCPTools:
                         "deltaQuote": fp_delta,
                         "tradeCount": trade_count,
                         "levels": profile_levels,
+                        "degraded": dq["degraded"],
                     },
                     "extra": {"acr": acr, "rf": rf, "klineVWAP": k_vwap},
+                    "dataQuality": dq,
                 }
 
             return out
@@ -514,6 +701,20 @@ class MCPTools:
 
         cur_date = _fmt_date(day_start)
         pd_date = _fmt_date(prev_day_start)
+        session_windows = []
+        for sdef in session_defs:
+            start_ms = day_start + int(sdef.start_minutes) * 60_000
+            end_ms = day_start + int(sdef.end_minutes) * 60_000
+            if sdef.end_minutes <= sdef.start_minutes:
+                end_ms += 86_400_000
+            session_windows.append(
+                {
+                    "name": sdef.name,
+                    "startTime": start_ms,
+                    "endTime": end_ms,
+                    "timezone": "UTC",
+                }
+            )
 
         return {
             "symbol": symbol,
@@ -528,6 +729,7 @@ class MCPTools:
             "currentDay": {"date": cur_date, "dayStart": day_start, "sessions": cur_sessions},
             "previousDay": {"date": pd_date, "dayStart": prev_day_start, "sessions": prev_sessions},
             "unit": "USDT",
+            "sessionWindows": session_windows,
             "notes": [
                 "When session='all', currentDay omits sessions that have not started yet (requested).",
                 "Profile(vPOC/vVAH/vVAL, buy/sell notional) uses local footprint_1m when available; otherwise totals fall back to Binance klines.",
@@ -730,6 +932,15 @@ class MCPTools:
             )
 
         # Full footprint levels (can be large)
+        cov_raw = await self.storage.get_footprint_coverage(symbol, start_time, end_time)
+        cov_pct = float(
+            (cov_raw.get("minute_buckets") or 0)
+            / max(1, int((end_time - start_time) / 60_000))
+        )
+        if cov_pct < self.coverage_threshold:
+            await self._maybe_backfill_footprint(symbol, start_time, end_time, coverage_pct=cov_pct)
+            cov_raw = await self.storage.get_footprint_coverage(symbol, start_time, end_time)
+
         data = await self.footprint.get_footprint_range(symbol, start_time, end_time, timeframe=timeframe)
 
         # Safety: truncate levels per bar to avoid giant payloads
@@ -749,6 +960,14 @@ class MCPTools:
             "view": "levels",
             "levelsTruncated": truncated,
             "bars": data,
+            "dataQuality": self._build_data_quality(
+                window_start_ms=start_time,
+                window_end_ms=end_time,
+                coverage_raw=cov_raw,
+                bars_returned=len(data),
+                levels_count=sum(len((b.get("levels") or [])) for b in data),
+                source="local",
+            ),
         }
 
     async def get_footprint_statistics(
@@ -782,6 +1001,16 @@ class MCPTools:
         if bucket_ms is None:
             raise ValueError(f"Unsupported timeframe for statistics: {timeframe}")
 
+        # Coverage check & optional on-demand backfill
+        cov_raw = await self.storage.get_footprint_coverage(symbol, start_time, end_time)
+        cov_pct = float(
+            (cov_raw.get("minute_buckets") or 0)
+            / max(1, int((end_time - start_time) / 60_000))
+        )
+        if cov_pct < self.coverage_threshold:
+            await self._maybe_backfill_footprint(symbol, start_time, end_time, coverage_pct=cov_pct)
+            cov_raw = await self.storage.get_footprint_coverage(symbol, start_time, end_time)
+
         rows = await self.storage.get_footprint_statistics(symbol, start_time, end_time, bucket_ms=bucket_ms)
 
         bars: list[dict[str, Any]] = []
@@ -811,6 +1040,14 @@ class MCPTools:
             "startTime": start_time,
             "endTime": end_time,
             "bars": bars,
+            "dataQuality": self._build_data_quality(
+                window_start_ms=start_time,
+                window_end_ms=end_time,
+                coverage_raw=cov_raw,
+                bars_returned=len(bars),
+                levels_count=None,
+                source="local",
+            ),
         }
 
     async def get_orderflow_metrics(
@@ -844,7 +1081,17 @@ class MCPTools:
         )
         cvd_sequence = delta_data.get("cvdSequence", [])
         current_cvd = cvd_sequence[-1]["cvd"] if cvd_sequence else delta_data.get("currentCVD", 0)
-        
+
+        cov_raw = await self.storage.get_footprint_coverage(symbol, start_time, end_time)
+        dq = self._build_data_quality(
+            window_start_ms=start_time,
+            window_end_ms=end_time,
+            coverage_raw=cov_raw,
+            bars_returned=delta_data.get("summary", {}).get("barCount"),
+            levels_count=len(cvd_sequence) if cvd_sequence else None,
+            source="local",
+        )
+
         # Get footprint bars for imbalance analysis
         footprint_bars = await self.footprint.get_footprint_range(
             symbol=symbol,
@@ -889,6 +1136,7 @@ class MCPTools:
             "currentCVD": current_cvd,
             "imbalances": imbalance_analysis,
             "volumeUnit": symbol.replace("USDT", ""),
+            "dataQuality": dq,
         }
     
     async def get_orderbook_depth_delta(
@@ -968,6 +1216,12 @@ class MCPTools:
                 "symbol": symbol,
                 "enabled": False,
                 "message": "Heatmap is disabled. Set HEATMAP_ENABLED=true to enable sampling.",
+                "howToEnable": "Set HEATMAP_ENABLED=true and restart the MCP server.",
+                "dataQuality": {
+                    "isEnabled": False,
+                    "degraded": True,
+                    "reasons": ["heatmap_disabled"],
+                },
             }
 
         now_ms = timestamp_ms()
@@ -979,6 +1233,12 @@ class MCPTools:
                 "symbol": symbol,
                 "enabled": True,
                 "message": "No heatmap data yet. Wait for snapshots to accumulate.",
+                "dataQuality": {
+                    "isEnabled": True,
+                    "degraded": True,
+                    "reasons": ["no_snapshots"],
+                    "coverageMinutes": 0,
+                },
             }
 
         # Current mid price from in-memory book (best-effort)
@@ -1003,12 +1263,25 @@ class MCPTools:
             "binSize": float(getattr(self.settings, "heatmap_bin_ticks", 10.0)),
             "percentRange": float(getattr(self.settings, "heatmap_depth_percent", 1.0)),
         }
+        is_stale = False
+        if coverage["latestTimestamp"] is not None:
+            is_stale = (now_ms - coverage["latestTimestamp"]) > max(2, int(self.settings.heatmap_interval_sec * 3)) * 1000
+        dq = {
+            "isEnabled": True,
+            "degraded": coverage["uniqueSnapshots"] == 0 or is_stale,
+            "reasons": (
+                ["stale_snapshots"] if is_stale else []
+            ) + (["no_snapshots"] if coverage["uniqueSnapshots"] == 0 else []),
+            "lastUpdateMs": coverage["latestTimestamp"],
+            "coverageMinutes": lookback_minutes,
+        }
 
         return {
             "symbol": symbol,
             "enabled": True,
             "midPrice": mid,
             "coverage": coverage,
+            "dataQuality": dq,
             "topBidBins": [
                 {
                     "priceBin": float(r["price_bin"]),
@@ -1296,6 +1569,15 @@ class MCPTools:
             # Use the dedicated TPO tick size defaults from env.
             tick_size = self._get_tpo_tick_size_safe(symbol)
 
+        cov_raw = await self.storage.get_footprint_coverage(symbol, start_ms, effective_end)
+        cov_pct = float(
+            (cov_raw.get("minute_buckets") or 0)
+            / max(1, int((effective_end - start_ms) / 60_000))
+        )
+        if cov_pct < self.coverage_threshold:
+            await self._maybe_backfill_footprint(symbol, start_ms, effective_end, coverage_pct=cov_pct)
+            cov_raw = await self.storage.get_footprint_coverage(symbol, start_ms, effective_end)
+
         # Build TPO profile from footprint (up to effective_end for developing sessions)
         tpo_profile = await self.tpo_profile.build_profile(
             symbol=symbol,
@@ -1453,26 +1735,45 @@ class MCPTools:
 
                 # Keep tails as explicit levels (usually short), compress body + total.
                 body_sample: list[float]
-                if len(body) > 30:
-                    body_sample = body[:15] + body[-15:]
-                else:
-                    body_sample = body
+            if len(body) > 30:
+                body_sample = body[:15] + body[-15:]
+            else:
+                body_sample = body
 
-                tpo_profile["singlePrints"] = {
-                    "tailMinLength": int(sp.get("tailMinLength") or tail_min_len),
-                    "tickSize": ts,
-                    "counts": {
-                        "levels": int(len(levels)),
-                        "lowTail": int(len(low_tail)),
-                        "highTail": int(len(high_tail)),
-                        "body": int(len(body)),
-                    },
-                    "lowTailLevels": low_tail,
-                    "highTailLevels": high_tail,
-                    "levelRanges": _compress(levels),
-                    "bodyRanges": _compress(body),
-                    "bodySample": body_sample,
-                }
+            tpo_profile["singlePrints"] = {
+                "tailMinLength": int(sp.get("tailMinLength") or tail_min_len),
+                "tickSize": ts,
+                "counts": {
+                    "levels": int(len(levels)),
+                    "lowTail": int(len(low_tail)),
+                    "highTail": int(len(high_tail)),
+                    "body": int(len(body)),
+                },
+                "lowTailLevels": low_tail,
+                "highTailLevels": high_tail,
+                "levelRanges": _compress(levels),
+                "bodyRanges": _compress(body),
+                "bodySample": body_sample,
+            }
+
+        dq = self._build_data_quality(
+            window_start_ms=start_ms,
+            window_end_ms=effective_end,
+            coverage_raw=cov_raw,
+            bars_returned=None,
+            levels_count=tpo_profile.get("priceLevelCount"),
+            source="footprint_1m",
+        )
+        if dq["degraded"]:
+            for key in ("poc", "vah", "val"):
+                if key in tpo_profile.get("timeBased", {}):
+                    tpo_profile["timeBased"][key] = None
+                if key in tpo_profile.get("active", {}):
+                    tpo_profile["active"][key] = None
+            for key in ("vpoc", "vvah", "vval"):
+                if key in tpo_profile.get("volumeBased", {}):
+                    tpo_profile["volumeBased"][key] = None
+            warnings.append("Low coverage: profile levels may be unreliable; key levels nulled.")
 
         return {
             "symbol": symbol,
@@ -1496,6 +1797,7 @@ class MCPTools:
                 "ibHigh": ib_high,
                 "ibLow": ib_low,
             },
+            "dataQuality": dq,
             "warnings": warnings,
         }
 

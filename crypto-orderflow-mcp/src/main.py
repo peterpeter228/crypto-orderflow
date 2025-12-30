@@ -308,6 +308,8 @@ class CryptoOrderflowServer:
         async def _startup_backfill() -> None:
             if not self.settings.backfill_enabled:
                 return
+            block_start_ms = timestamp_ms()
+            max_block_ms = getattr(self.settings, "backfill_block_startup_timeout_ms", 300_000)
 
             start_ms, end_ms = get_required_backfill_range()
             backfiller = AggTradesBackfiller(self.rest_client, self.storage)
@@ -315,6 +317,13 @@ class CryptoOrderflowServer:
 
             try:
                 for symbol in self.settings.symbol_list:
+                    if max_block_ms > 0 and (timestamp_ms() - block_start_ms) > max_block_ms:
+                        self.logger.warning(
+                            "backfill_blocking_timeout_exceeded",
+                            timeout_ms=max_block_ms,
+                            note="Startup backfill stopped early; server will continue boot.",
+                        )
+                        break
                     try:
                         self.logger.info(
                             "backfill_symbol_start",
@@ -355,6 +364,13 @@ class CryptoOrderflowServer:
                     except Exception as e:
                         # Do NOT fail the whole server if one symbol backfill fails.
                         self.logger.warning("backfill_symbol_failed", symbol=symbol, error=str(e))
+                    if max_block_ms > 0 and (timestamp_ms() - block_start_ms) > max_block_ms:
+                        self.logger.warning(
+                            "backfill_blocking_timeout_exceeded",
+                            timeout_ms=max_block_ms,
+                            note="Startup backfill stopped early; server will continue boot.",
+                        )
+                        break
             finally:
                 try:
                     await backfiller.close()
