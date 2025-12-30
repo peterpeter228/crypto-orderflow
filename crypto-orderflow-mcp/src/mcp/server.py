@@ -101,6 +101,26 @@ def create_mcp_server(tools: MCPTools) -> tuple[FastAPI, None]:
                         "description": "Session timezone (default: UTC)",
                         "default": "UTC",
                     },
+                    "binSize": {
+                        "type": "number",
+                        "description": "Price bin size used for vPOC/VAH/VAL (Exocharts T parameter)",
+                    },
+                    "valueAreaPercent": {
+                        "type": "number",
+                        "description": "Value area percentage (e.g., 70 for 70%)",
+                        "default": 70.0,
+                    },
+                    "mode": {
+                        "type": "string",
+                        "description": "Profile mode: raw or synthetic",
+                        "enum": ["raw", "synthetic"],
+                        "default": "raw",
+                    },
+                    "normalizeSeconds": {
+                        "type": "integer",
+                        "description": "Normalization bucket in seconds when mode=synthetic (default 3s)",
+                        "default": 3,
+                    },
                 },
                 "required": ["symbol"],
             },
@@ -140,6 +160,35 @@ def create_mcp_server(tools: MCPTools) -> tuple[FastAPI, None]:
                         "type": "integer",
                         "description": "When view='levels', cap returned price levels per bar (default 200)",
                         "default": 200,
+                    },
+                    "binSize": {
+                        "type": "number",
+                        "description": "Price bin size (Exocharts T parameter) when view='levels'",
+                    },
+                    "tickSize": {
+                        "type": "number",
+                        "description": "Alias for binSize to remain backward compatible",
+                    },
+                    "priceLevelLimit": {
+                        "type": "integer",
+                        "description": "Hard cap of price levels per bar after compression",
+                    },
+                    "topNLevels": {
+                        "type": "integer",
+                        "description": "Keep only top-N levels by volume per bar (compression)",
+                    },
+                    "compress": {
+                        "type": "boolean",
+                        "description": "Enable compact levels output (default true)",
+                        "default": True,
+                    },
+                    "cursor": {
+                        "type": "integer",
+                        "description": "Offset for paginating bars in the response",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Limit number of bars returned (used with cursor)",
                     },
                 },
                 "required": ["symbol"],
@@ -305,6 +354,29 @@ def create_mcp_server(tools: MCPTools) -> tuple[FastAPI, None]:
                         "type": "integer",
                         "description": "Cap returned profile levels (default 400)",
                         "default": 400,
+                    },
+                    "binSize": {
+                        "type": "number",
+                        "description": "Price bin size (Exocharts T parameter) for the session profile",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "description": "Profile mode: raw or synthetic",
+                        "enum": ["raw", "synthetic"],
+                        "default": "raw",
+                    },
+                    "normalizeSeconds": {
+                        "type": "integer",
+                        "description": "Normalization bucket (seconds) when mode=synthetic",
+                        "default": 3,
+                    },
+                    "windowStartMs": {
+                        "type": "integer",
+                        "description": "Optional override for VR/Session window start (ms)",
+                    },
+                    "windowEndMs": {
+                        "type": "integer",
+                        "description": "Optional override for VR/Session window end (ms)",
                     },
                 },
                 "required": ["symbol"],
@@ -529,6 +601,10 @@ def create_mcp_server(tools: MCPTools) -> tuple[FastAPI, None]:
                 arguments["symbol"],
                 date=arguments.get("date"),
                 session_tz=arguments.get("sessionTZ", "UTC"),
+                bin_size=arguments.get("binSize"),
+                value_area_pct=float(arguments.get("valueAreaPercent", 70.0)),
+                mode=arguments.get("mode", "raw"),
+                normalize_seconds=int(arguments.get("normalizeSeconds", 3)),
             )
 
         if name == "get_footprint":
@@ -539,6 +615,13 @@ def create_mcp_server(tools: MCPTools) -> tuple[FastAPI, None]:
                 end_time=arguments.get("endTime"),
                 view=arguments.get("view", "statistics"),
                 max_levels_per_bar=int(arguments.get("maxLevelsPerBar", 200) or 200),
+                bin_size=arguments.get("binSize"),
+                tick_size=arguments.get("tickSize"),
+                price_level_limit=arguments.get("priceLevelLimit"),
+                top_n_levels=arguments.get("topNLevels"),
+                compress=bool(arguments.get("compress", True)),
+                cursor=int(arguments.get("cursor")) if arguments.get("cursor") is not None else None,
+                limit=int(arguments.get("limit")) if arguments.get("limit") is not None else None,
             )
 
         if name == "get_footprint_statistics":
@@ -589,6 +672,11 @@ def create_mcp_server(tools: MCPTools) -> tuple[FastAPI, None]:
                 value_area_percent=float(arguments.get("valueAreaPercent", 70.0)),
                 include_profile_levels=bool(arguments.get("includeProfileLevels", False)),
                 max_profile_levels=int(arguments.get("maxProfileLevels", 400)),
+                bin_size=arguments.get("binSize"),
+                mode=arguments.get("mode", "raw"),
+                normalize_seconds=int(arguments.get("normalizeSeconds", 3)),
+                window_start_ms=arguments.get("windowStartMs"),
+                window_end_ms=arguments.get("windowEndMs"),
             )
 
         if name == "get_tpo_profile":

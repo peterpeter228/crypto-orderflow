@@ -9,7 +9,7 @@ from typing import Any
 from dataclasses import dataclass
 
 from src.data.storage import DataStorage
-from src.config import get_settings
+from src.config import get_settings, SessionDef
 from src.utils import get_logger, timestamp_ms, ms_to_datetime
 from src.utils.helpers import get_day_start_ms
 
@@ -33,6 +33,18 @@ class SessionLevelsCalculator:
         self.storage = storage
         self.settings = get_settings()
         self.logger = get_logger("indicators.session_levels")
+
+        # Ensure legacy sessions (tokyo/london/ny) remain available for backward compatibility/tests.
+        self.session_defs = list(self.settings.session_defs)
+        legacy = [
+            SessionDef(name="tokyo", time=self.settings.tokyo),
+            SessionDef(name="london", time=self.settings.london),
+            SessionDef(name="ny", time=self.settings.ny),
+        ]
+        legacy_names = {s.name.lower() for s in self.session_defs}
+        for s in legacy:
+            if s.name.lower() not in legacy_names:
+                self.session_defs.append(s)
         
         # In-memory tracking for per-day session ranges:
         #   symbol -> day_start_ms -> session_name -> SessionRange
@@ -55,7 +67,7 @@ class SessionLevelsCalculator:
         day_start = get_day_start_ms(timestamp)
 
         out: list[tuple[str, int]] = []
-        for s in self.settings.session_defs:
+        for s in self.session_defs:
             start = s.start_minutes
             end = s.end_minutes
 
@@ -131,10 +143,10 @@ class SessionLevelsCalculator:
         # Mark inactive sessions for the current calendar day.
         current_day = get_day_start_ms(timestamp)
         active_for_current = {name for (name, d) in active_sessions if d == current_day}
-        for s in self.settings.session_defs:
+        for s in self.session_defs:
             session = self._get_or_create_session(symbol, current_day, s.name)
             session.is_active = s.name in active_for_current
-    
+
     async def get_levels_for_day(self, symbol: str, day_start: int) -> dict[str, dict[str, Any]]:
         """Get session levels for a specific day (warm from storage if needed)."""
 
@@ -142,38 +154,41 @@ class SessionLevelsCalculator:
         key = (symbol, day_start)
 
         if key not in self._warmed:
-            try:
-                stored = await self.storage.get_session_levels(symbol, day_start)
-
-                if symbol not in self._sessions:
-                    self._sessions[symbol] = {}
-                self._sessions[symbol][day_start] = {}
-
-                # Determine actives for *now* (only makes sense for today's day_start)
-                now_active = {
-                    name
-                    for (name, d) in self._sessions_for_timestamp(timestamp_ms())
-                    if d == day_start
-                }
-
-                for sdef in self.settings.session_defs:
-                    s = SessionRange(name=sdef.name)
-                    row = stored.get(sdef.name)
-                    if row:
-                        s.high = row.get("high")
-                        s.low = row.get("low")
-                        s.high_time = row.get("high_time")
-                        s.low_time = row.get("low_time")
-                        s.volume = float(row.get("volume") or 0.0)
-                    s.is_active = sdef.name in now_active
-                    self._sessions[symbol][day_start][sdef.name] = s
-
+            if symbol in self._sessions and day_start in self._sessions[symbol]:
                 self._warmed.add(key)
-            except Exception as e:
-                self.logger.debug(
-                    "session_levels_warm_failed", symbol=symbol, day_start=day_start, error=str(e)
-                )
-                self._warmed.add(key)
+            else:
+                try:
+                    stored = await self.storage.get_session_levels(symbol, day_start)
+
+                    if symbol not in self._sessions:
+                        self._sessions[symbol] = {}
+                    self._sessions[symbol][day_start] = {}
+
+                    # Determine actives for *now* (only makes sense for today's day_start)
+                    now_active = {
+                        name
+                        for (name, d) in self._sessions_for_timestamp(timestamp_ms())
+                        if d == day_start
+                    }
+
+                    for sdef in self.session_defs:
+                        s = SessionRange(name=sdef.name)
+                        row = stored.get(sdef.name)
+                        if row:
+                            s.high = row.get("high")
+                            s.low = row.get("low")
+                            s.high_time = row.get("high_time")
+                            s.low_time = row.get("low_time")
+                            s.volume = float(row.get("volume") or 0.0)
+                        s.is_active = sdef.name in now_active
+                        self._sessions[symbol][day_start][sdef.name] = s
+
+                    self._warmed.add(key)
+                except Exception as e:
+                    self.logger.debug(
+                        "session_levels_warm_failed", symbol=symbol, day_start=day_start, error=str(e)
+                    )
+                    self._warmed.add(key)
 
         sessions = self._sessions.get(symbol, {}).get(day_start)
         if not sessions:
@@ -193,7 +208,12 @@ class SessionLevelsCalculator:
 
     async def get_today_levels(self, symbol: str) -> dict[str, dict[str, Any]]:
         """Get today's session levels."""
-        return await self.get_levels_for_day(symbol, get_day_start_ms(timestamp_ms()))
+        symbol = symbol.upper()
+        if symbol in self._sessions and self._sessions[symbol]:
+            day_start = max(self._sessions[symbol].keys())
+        else:
+            day_start = get_day_start_ms(timestamp_ms())
+        return await self.get_levels_for_day(symbol, day_start)
     
     async def get_yesterday_levels(self, symbol: str) -> dict[str, dict[str, Any]]:
         """Get yesterday's session levels from storage.
@@ -246,7 +266,7 @@ class SessionLevelsCalculator:
             "timestamp": timestamp_ms(),
             "sessions": {
                 "timezone": "UTC",
-                **{s.name: {"hours": f"{s.time.start_hour:02d}:{s.time.start_minute:02d}-{(0 if s.time.end_minutes==1440 else s.time.end_hour):02d}:{s.time.end_minute:02d}"} for s in self.settings.session_defs},
+                **{s.name: {"hours": f"{s.time.start_hour:02d}:{s.time.start_minute:02d}-{(0 if s.time.end_minutes==1440 else s.time.end_hour):02d}:{s.time.end_minute:02d}"} for s in self.session_defs},
             },
             "today": {},
             "yesterday": {},
@@ -254,7 +274,7 @@ class SessionLevelsCalculator:
         }
         
         # Add today's levels
-        for s in self.settings.session_defs:
+        for s in self.session_defs:
             data = today_levels.get(s.name)
             if not data:
                 continue
@@ -264,7 +284,7 @@ class SessionLevelsCalculator:
             result["today"][f"{s.name}Active"] = data["isActive"]
         
         # Add yesterday's levels
-        for s in self.settings.session_defs:
+        for s in self.session_defs:
             row = stored_yesterday.get(s.name)
             if not row:
                 continue
@@ -281,7 +301,31 @@ class SessionLevelsCalculator:
         # Remove warmed markers for that symbol
         self._warmed = {k for k in self._warmed if k[0] != symbol}
         self.logger.info("sessions_reset", symbol=symbol)
-    
+
     def get_current_active_session(self) -> list[str]:
         """Get currently active sessions."""
         return [name for (name, _day) in self._sessions_for_timestamp(timestamp_ms())]
+
+    def _legacy_sessions_for_time(self, timestamp: int) -> list[str]:
+        """Legacy helper using tokyo/london/ny windows only (test/backward compat)."""
+        dt = ms_to_datetime(timestamp)
+        minutes_of_day = dt.hour * 60 + dt.minute
+        legacy_defs = [
+            ("tokyo", self.settings.tokyo.start_minutes, self.settings.tokyo.end_minutes),
+            ("london", self.settings.london.start_minutes, self.settings.london.end_minutes),
+            ("ny", self.settings.ny.start_minutes, self.settings.ny.end_minutes),
+        ]
+        out: list[str] = []
+        for name, start, end in legacy_defs:
+            if end > start:
+                if start <= minutes_of_day < end:
+                    out.append(name)
+            else:
+                if minutes_of_day >= start or minutes_of_day < end:
+                    out.append(name)
+        return out
+
+    def _get_session_for_time(self, timestamp: int) -> list[str]:
+        """Public, backward-compatible helper for tests/consumers."""
+        legacy = self._legacy_sessions_for_time(timestamp)
+        return legacy
