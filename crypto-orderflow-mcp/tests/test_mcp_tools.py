@@ -124,3 +124,62 @@ async def test_get_session_profile_handles_missing_footprint():
     assert profile["vPOC"] is None
     assert profile["vVAH"] is None
     assert profile["vVAL"] is None
+
+
+@pytest.mark.anyio
+async def test_session_profile_vwap_uses_base_volume():
+    """Session VWAP should be derived from quote/base volumes in the same dataset (price units)."""
+    cache = MagicMock()
+    storage = MagicMock()
+    orderbook = MagicMock()
+    rest_client = MagicMock()
+    vwap = MagicMock()
+    volume_profile = MagicMock()
+    tpo_profile = MagicMock()
+    session_levels = MagicMock()
+    footprint = MagicMock()
+    delta_cvd = MagicMock()
+    imbalance = MagicMock()
+    depth_delta = MagicMock()
+    profile_engine = MagicMock()
+
+    storage.get_profile_range = AsyncMock(
+        return_value=[
+            {"price_level": 100_000.0, "buy_volume": 0.5, "sell_volume": 0.5, "trade_count": 10},
+            {"price_level": 101_000.0, "buy_volume": 0.25, "sell_volume": 0.25, "trade_count": 5},
+        ]
+    )
+    storage.get_footprint_coverage = AsyncMock(return_value={"minute_buckets": 60, "min_ts": 0, "max_ts": 60_000})
+    rest_client.get_klines = AsyncMock(return_value=[])
+    profile_engine.build_profile = AsyncMock(
+        return_value={
+            "valueArea": {"vPOC": None, "VAH": None, "VAL": None},
+            "totals": {"totalVolume": 0.0, "binCount": 0},
+            "dataQuality": {"coveragePct": 1.0, "minuteBuckets": 60, "expectedMinutes": 60},
+            "levels": [],
+        }
+    )
+
+    tools = MCPTools(
+        cache=cache,
+        storage=storage,
+        orderbook=orderbook,
+        rest_client=rest_client,
+        vwap=vwap,
+        volume_profile=volume_profile,
+        tpo_profile=tpo_profile,
+        session_levels=session_levels,
+        footprint=footprint,
+        delta_cvd=delta_cvd,
+        imbalance=imbalance,
+        depth_delta=depth_delta,
+        profile_engine=profile_engine,
+    )
+
+    result = await tools.get_session_profile(symbol="BTCUSDT", date="1970-01-02")
+    first_pd_session = next(iter(result["pdSessions"].values()))
+    vwap_value = first_pd_session["vwap"]
+
+    expected_vwap = (100_000.0 * 1.0 + 101_000.0 * 0.5) / 1.5
+    assert vwap_value is not None
+    assert abs(vwap_value - expected_vwap) < 1e-6

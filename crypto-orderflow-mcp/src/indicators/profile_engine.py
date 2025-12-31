@@ -124,7 +124,7 @@ class VolumeProfileEngine:
         if self.backfill_callback is None or coverage_pct >= self.coverage_threshold:
             return
         try:
-            await self.backfill_callback(symbol, start_ms, end_ms, coverage_pct)
+            await self.backfill_callback(symbol, start_ms, end_ms, coverage_pct=coverage_pct)
         except Exception as exc:  # pragma: no cover - defensive logging
             self.logger.warning("profile_backfill_failed", symbol=symbol, error=str(exc))
 

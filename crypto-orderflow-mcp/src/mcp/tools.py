@@ -948,11 +948,18 @@ class MCPTools:
                     quality_flags.append("low_coverage")
 
                 vol_quote = quote_profile.get("volumeQuote") or k_quote
+                base_volume = float(quote_profile.get("baseVolume") or 0.0)
                 buy_quote = quote_profile.get("buyQuote") or 0.0
                 sell_quote = quote_profile.get("sellQuote") or 0.0
                 delta_quote = quote_profile.get("deltaQuote", k_delta)
                 profile_available = bool(quote_profile.get("histogram"))
-                vwap = (vol_quote / k_base) if profile_available and k_base > 0 else k_vwap
+                vwap = None
+                if profile_available and base_volume > 0:
+                    vwap = vol_quote / base_volume
+                elif k_base > 0:
+                    vwap = k_quote / k_base
+                else:
+                    vwap = k_vwap
                 totals_source = quote_rows_source if profile_available else "binance_klines"
 
                 out[name] = {
@@ -1255,7 +1262,12 @@ class MCPTools:
             await self._maybe_backfill_footprint(symbol, start_time, end_time, coverage_pct=cov_pct)
             cov_raw = await self.storage.get_footprint_coverage(symbol, start_time, end_time)
 
-        data = await self.footprint.get_footprint_range(symbol, start_time, end_time, timeframe=timeframe)
+        data = await self.footprint.get_footprint_range(
+            symbol=symbol,
+            timeframe=timeframe,
+            start_time=start_time,
+            end_time=end_time,
+        )
 
         bin_sz = None
         if bin_size is not None:
