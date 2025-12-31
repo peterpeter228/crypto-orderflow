@@ -1585,6 +1585,11 @@ class MCPTools:
             Summary (top bid/ask liquidity bins) + coverage metadata
         """
         symbol = symbol.upper()
+        lookback_minutes = int(
+            lookback_minutes
+            if lookback_minutes is not None
+            else getattr(self.settings, "heatmap_lookback_minutes", 180)
+        )
 
         if not getattr(self.settings, "heatmap_enabled", False) or self.heatmap is None:
             return {
@@ -1603,12 +1608,31 @@ class MCPTools:
         now_ms = timestamp_ms()
         start_ms = now_ms - int(lookback_minutes * 60_000)
 
-        latest_rows = await self.storage.get_latest_orderbook_heatmap_snapshot(symbol)
+        latest_snapshot = await self.storage.get_latest_orderbook_heatmap_snapshot(symbol)
+        if isinstance(latest_snapshot, tuple) and len(latest_snapshot) == 2:
+            latest_ts, latest_rows = latest_snapshot
+        else:
+            latest_ts, latest_rows = None, latest_snapshot or []
         if not latest_rows:
+            warmup = {
+                "expectedMinutes": lookback_minutes,
+                "note": "Allow one full lookback window for the sampler to accumulate snapshots.",
+            }
+            coverage = {
+                "lookbackMinutes": lookback_minutes,
+                "startTime": start_ms,
+                "endTime": now_ms,
+                "uniqueSnapshots": 0,
+                "latestTimestamp": latest_ts,
+                "binSize": float(getattr(self.settings, "heatmap_bin_ticks", 10.0)),
+                "percentRange": float(getattr(self.settings, "heatmap_depth_percent", 1.0)),
+            }
             return {
                 "symbol": symbol,
                 "enabled": True,
                 "message": "No heatmap data yet. Wait for snapshots to accumulate.",
+                "warmup": warmup,
+                "coverage": coverage,
                 "dataQuality": {
                     "isEnabled": True,
                     "degraded": True,
@@ -1628,14 +1652,29 @@ class MCPTools:
         top_asks = sorted(latest_rows, key=lambda r: float(r.get("ask_volume", 0.0)), reverse=True)[: max_levels]
 
         # Basic coverage info (how many unique timestamps in lookback)
-        rows = await self.storage.get_orderbook_heatmap_range(symbol, start_ms, now_ms)
-        ts_set = {int(r["timestamp"]) for r in rows} if rows else set()
+        cached_meta = self.cache.get_heatmap_metadata(symbol)
+        meta_matches = cached_meta and int(cached_meta.get("lookbackMinutes", 0)) == lookback_minutes
+        coverage_meta = cached_meta if meta_matches else None
+        if coverage_meta is None:
+            coverage_meta = await self.storage.get_orderbook_heatmap_coverage(symbol, start_ms, now_ms)
+            coverage_meta = {
+                "uniqueSnapshots": coverage_meta.get("uniqueSnapshots", 0),
+                "latestTimestamp": coverage_meta.get("latestTimestamp"),
+                "lookbackMinutes": lookback_minutes,
+                "sampledAtMs": now_ms,
+            }
+            try:
+                self.cache.set_heatmap_metadata(symbol, coverage_meta)
+            except Exception:
+                pass
+
+        latest_timestamp = latest_ts if latest_ts is not None else coverage_meta.get("latestTimestamp")
         coverage = {
             "lookbackMinutes": lookback_minutes,
             "startTime": start_ms,
             "endTime": now_ms,
-            "uniqueSnapshots": len(ts_set),
-            "latestTimestamp": int(latest_rows[0]["timestamp"]) if latest_rows else None,
+            "uniqueSnapshots": int(coverage_meta.get("uniqueSnapshots", 0)),
+            "latestTimestamp": latest_timestamp,
             "binSize": float(getattr(self.settings, "heatmap_bin_ticks", 10.0)),
             "percentRange": float(getattr(self.settings, "heatmap_depth_percent", 1.0)),
         }
@@ -1652,12 +1691,18 @@ class MCPTools:
             "coverageMinutes": lookback_minutes,
         }
 
+        warmup = {
+            "expectedMinutes": lookback_minutes,
+            "note": "Heatmap snapshots accumulate continuously; allow one full lookback window after enabling.",
+        }
+
         return {
             "symbol": symbol,
             "enabled": True,
             "midPrice": mid,
             "coverage": coverage,
             "dataQuality": dq,
+            "warmup": warmup,
             "remediation": (
                 "Wait for new snapshots or reduce lookbackMinutes to fit collected window."
                 if dq["degraded"]

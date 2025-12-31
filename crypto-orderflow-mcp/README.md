@@ -49,6 +49,8 @@
 ### 可选：Orderbook Heatmap（流动性热力图）
 - 周期性对内存 orderbook 做价格分桶快照并写入 SQLite
 - 通过 MCP 工具获取最新 snapshot 的 top liquidity levels（可用于外部可视化）
+- 通过环境变量控制：`HEATMAP_ENABLED=true` 打开采样，`HEATMAP_INTERVAL_SEC` 控制快照频率，`HEATMAP_LOOKBACK_MINUTES` / `HEATMAP_SAMPLE_INTERVAL_MS` 控制后台元数据采样窗口与频率
+- 开启后需要预热：至少等待一个 `HEATMAP_LOOKBACK_MINUTES` 窗口才能看到完整覆盖（metadata sampler 会返回 coverage/staleness 信息）
 
 ## 快速开始
 

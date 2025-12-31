@@ -1195,3 +1195,27 @@ class DataStorage:
         )
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
+
+    async def get_orderbook_heatmap_coverage(
+        self,
+        symbol: str,
+        start_time: int,
+        end_time: int,
+    ) -> dict[str, Any]:
+        """Get coverage metadata (count + latest ts) without loading full ladders."""
+        if not self._db:
+            return {"uniqueSnapshots": 0, "latestTimestamp": None}
+
+        cursor = await self._db.execute(
+            """
+            SELECT COUNT(DISTINCT timestamp) AS snapshots, MAX(timestamp) AS latest
+            FROM orderbook_heatmap
+            WHERE symbol = ? AND timestamp >= ? AND timestamp <= ?
+            """,
+            (symbol, start_time, end_time),
+        )
+        row = await cursor.fetchone()
+        return {
+            "uniqueSnapshots": int(row["snapshots"] or 0),
+            "latestTimestamp": int(row["latest"]) if row and row["latest"] is not None else None,
+        }

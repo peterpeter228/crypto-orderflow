@@ -213,7 +213,15 @@ class Settings(BaseSettings):
     # This is inspired by projects like flowsurface. We store a binned depth ladder
     # periodically so an external UI can render a heatmap.
     heatmap_enabled: bool = Field(default=False)
+    heatmap_lookback_minutes: int = Field(
+        default=180,
+        description="Default lookback window (minutes) for heatmap metadata coverage.",
+    )
     heatmap_interval_sec: int = Field(default=60, description="Heatmap snapshot interval")
+    heatmap_sample_interval_ms: int = Field(
+        default=15_000,
+        description="Metadata sampler interval (ms) when heatmap is enabled.",
+    )
     # Price bin size in quote units (USDT). For BTCUSDT, 10 means "10 USDT per bin".
     heatmap_bin_ticks: int = Field(default=10)
     # How far around mid price to record (percent). If 1.0 => +/-1%.

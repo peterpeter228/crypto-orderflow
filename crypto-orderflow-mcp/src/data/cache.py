@@ -56,6 +56,7 @@ class MemoryCache:
         self.logger = get_logger("data.cache")
         self._caches: dict[str, SymbolCache] = {}
         self._lock = asyncio.Lock()
+        self._heatmap_meta: dict[str, dict[str, Any]] = {}
     
     def get_cache(self, symbol: str) -> SymbolCache:
         """Get or create cache for symbol."""
@@ -190,3 +191,14 @@ class MemoryCache:
     def get_all_symbols(self) -> list[str]:
         """Get all cached symbols."""
         return list(self._caches.keys())
+
+    # ------------------------------
+    # Heatmap metadata (coverage / staleness)
+    # ------------------------------
+    def set_heatmap_metadata(self, symbol: str, meta: dict[str, Any]) -> None:
+        """Store heatmap metadata for a symbol."""
+        self._heatmap_meta[symbol.upper()] = meta
+
+    def get_heatmap_metadata(self, symbol: str) -> dict[str, Any] | None:
+        """Retrieve cached heatmap metadata for a symbol (if any)."""
+        return self._heatmap_meta.get(symbol.upper())
