@@ -79,6 +79,24 @@ class MCPTools:
                 coverage_threshold=self.coverage_threshold,
             )
 
+    def _validation_error(
+        self,
+        *,
+        code: str,
+        message: str,
+        details: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Return a structured validation error payload."""
+        return {
+            "ok": False,
+            "error": {
+                "type": "validation_error",
+                "code": code,
+                "message": message,
+                "details": details or {},
+            },
+        }
+
     def _build_data_quality(
         self,
         *,
@@ -134,6 +152,7 @@ class MCPTools:
             "source": source,
             "degraded": degraded,
             "reasons": reasons,
+            "qualityFlags": list(reasons),
             "remediation": remediation,
         }
 
@@ -1017,16 +1036,49 @@ class MCPTools:
             view: 'statistics' (default) or 'levels'
             max_levels_per_bar: When view='levels', caps the number of price levels returned per bar.
         """
+        timeframe = timeframe.lower()
+        view_normalized = view.lower()
+        valid_timeframes = {"1m", "5m", "15m", "30m", "1h", "4h", "1d"}
+        if timeframe not in valid_timeframes:
+            return self._validation_error(
+                code="unsupported_timeframe",
+                message=f"Timeframe must be one of {sorted(valid_timeframes)}",
+                details={"timeframe": timeframe},
+            )
+
+        bin_param = bin_size if bin_size is not None else tick_size
+        if bin_param is not None and float(bin_param) <= 0:
+            return self._validation_error(
+                code="invalid_bin_size",
+                message="binSize/tickSize must be greater than zero when provided",
+                details={"binSize": bin_param},
+            )
+
+        max_limit_cap = 500
+        if limit is not None:
+            if limit <= 0:
+                return self._validation_error(
+                    code="invalid_limit",
+                    message="limit must be a positive integer",
+                    details={"limit": limit},
+                )
+            if limit > max_limit_cap:
+                return self._validation_error(
+                    code="limit_exceeds_cap",
+                    message=f"limit is capped at {max_limit_cap}",
+                    details={"limit": limit, "maxLimit": max_limit_cap},
+                )
+
         end_time = end_time or timestamp_ms()
 
         # Default window: last 24h for 30m stats, otherwise last 2h
         if start_time is None:
-            if timeframe == "30m" and view == "statistics":
+            if timeframe == "30m" and view_normalized == "statistics":
                 start_time = end_time - 24 * 60 * 60 * 1000
             else:
                 start_time = end_time - 2 * 60 * 60 * 1000
 
-        if view.lower() != "levels":
+        if view_normalized != "levels":
             return await self.get_footprint_statistics(
                 symbol=symbol,
                 start_time=start_time,
@@ -1044,13 +1096,11 @@ class MCPTools:
             await self._maybe_backfill_footprint(symbol, start_time, end_time, coverage_pct=cov_pct)
             cov_raw = await self.storage.get_footprint_coverage(symbol, start_time, end_time)
 
-        data = await self.footprint.get_footprint_range(symbol, start_time, end_time, timeframe=timeframe)
+        data = await self.footprint.get_footprint_range(symbol, timeframe, start_time, end_time)
 
         bin_sz = None
-        if bin_size is not None:
-            bin_sz = float(bin_size)
-        elif tick_size is not None:
-            bin_sz = float(tick_size)
+        if bin_param is not None:
+            bin_sz = float(bin_param)
 
         price_cap = price_level_limit or max_levels_per_bar
         bars_out: list[dict[str, Any]] = []
@@ -1149,9 +1199,6 @@ class MCPTools:
         - Delta Max / Min (max/min per-price delta inside the bar, quote)
         - Trades (count)
         """
-        end_time = end_time or timestamp_ms()
-        start_time = start_time or (end_time - 24 * 60 * 60 * 1000)
-
         tf_ms_map = {
             "1m": 60_000,
             "5m": 300_000,
@@ -1161,9 +1208,17 @@ class MCPTools:
             "4h": 14_400_000,
             "1d": 86_400_000,
         }
+        timeframe = timeframe.lower()
         bucket_ms = tf_ms_map.get(timeframe)
         if bucket_ms is None:
-            raise ValueError(f"Unsupported timeframe for statistics: {timeframe}")
+            return self._validation_error(
+                code="unsupported_timeframe",
+                message=f"Timeframe must be one of {sorted(tf_ms_map)}",
+                details={"timeframe": timeframe},
+            )
+
+        end_time = end_time or timestamp_ms()
+        start_time = start_time or (end_time - 24 * 60 * 60 * 1000)
 
         # Coverage check & optional on-demand backfill
         cov_raw = await self.storage.get_footprint_coverage(symbol, start_time, end_time)
