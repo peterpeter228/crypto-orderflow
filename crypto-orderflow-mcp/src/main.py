@@ -32,6 +32,7 @@ from src.indicators import (
     DepthDeltaCalculator,
     OrderbookHeatmapSampler,
     TPOProfileCalculator,
+    HeatmapMetadataSampler,
 )
 from src.mcp import create_mcp_server, MCPTools
 from src import __version__
@@ -65,6 +66,12 @@ class CryptoOrderflowServer:
         self.heatmap = OrderbookHeatmapSampler(
             storage=self.storage,
             orderbook=self.orderbook,
+            settings=self.settings,
+            logger=self.logger,
+        )
+        self.heatmap_meta = HeatmapMetadataSampler(
+            storage=self.storage,
+            cache=self.cache,
             settings=self.settings,
             logger=self.logger,
         )
@@ -205,6 +212,27 @@ class CryptoOrderflowServer:
                 break
             except Exception as e:
                 self.logger.error("heatmap_task_error", error=str(e))
+                await asyncio.sleep(5)
+
+    async def _heatmap_metadata_task(self) -> None:
+        """Lightweight metadata sampler for heatmap coverage."""
+        if not getattr(self.settings, "heatmap_enabled", False):
+            while self._running:
+                try:
+                    await asyncio.sleep(60)
+                except asyncio.CancelledError:
+                    break
+            return
+
+        while self._running:
+            try:
+                for symbol in self.settings.symbol_list:
+                    await self.heatmap_meta.maybe_sample(symbol)
+                await asyncio.sleep(max(1, self.settings.heatmap_sample_interval_ms / 1000))
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.debug("heatmap_metadata_task_error", error=str(e))
                 await asyncio.sleep(5)
     
     async def _ticker_update_task(self) -> None:
@@ -439,6 +467,7 @@ class CryptoOrderflowServer:
             [
                 asyncio.create_task(self._depth_delta_task()),
                 asyncio.create_task(self._heatmap_task()) if getattr(self.settings, "heatmap_enabled", False) else None,
+                asyncio.create_task(self._heatmap_metadata_task()) if getattr(self.settings, "heatmap_enabled", False) else None,
                 asyncio.create_task(self._ticker_update_task()),
                 asyncio.create_task(self._cleanup_task()),
                 asyncio.create_task(self._day_rollover_task()),
