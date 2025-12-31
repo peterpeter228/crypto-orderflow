@@ -98,6 +98,87 @@ class CryptoOrderflowServer:
         self._backfill_task: asyncio.Task | None = None
         self._running = False
 
+    async def _startup_backfill(self) -> None:
+        """Run startup backfill for all configured symbols."""
+        if not self.settings.backfill_enabled:
+            return
+
+        start_ms, end_ms = get_required_backfill_range()
+        backfiller = AggTradesBackfiller(self.rest_client, self.storage)
+        clear_days = bool(getattr(self.settings, "backfill_rebuild", False))
+
+        try:
+            for symbol in self.settings.symbol_list:
+                try:
+                    self.logger.info(
+                        "backfill_symbol_start",
+                        symbol=symbol,
+                        start_ms=start_ms,
+                        end_ms=end_ms,
+                        rebuild=clear_days,
+                    )
+                    result = await backfiller.backfill_symbol_range(
+                        symbol=symbol,
+                        start_time=start_ms,
+                        end_time=end_ms,
+                        max_requests=(
+                            self.settings.backfill_max_requests_per_symbol
+                            if self.settings.backfill_max_requests_per_symbol > 0
+                            else None
+                        ),
+                        pause_ms=self.settings.backfill_request_pause_ms,
+                        clear_days=clear_days,
+                    )
+
+                    # Prime day CVD so snapshot numbers are meaningful.
+                    day_start = get_day_start_ms(end_ms)
+                    if result.cvd_end_day is not None:
+                        self.cache.set_cvd(symbol, float(result.cvd_end_day), reset_time=day_start)
+                    else:
+                        try:
+                            cvd = await self.storage.get_day_cvd(symbol, day_start)
+                            if cvd is not None:
+                                self.cache.set_cvd(symbol, float(cvd), reset_time=day_start)
+                        except Exception:
+                            pass
+
+                    self.logger.info("backfill_done", **result.__dict__)
+
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    # Do NOT fail the whole server if one symbol backfill fails.
+                    self.logger.warning("backfill_symbol_failed", symbol=symbol, error=str(e))
+        finally:
+            try:
+                await backfiller.close()
+            except Exception:
+                pass
+
+    async def _launch_backfill(self) -> None:
+        """Start backfill respecting optional startup blocking timeout."""
+        if not self.settings.backfill_enabled:
+            return
+
+        self._backfill_task = asyncio.create_task(self._startup_backfill())
+
+        if not getattr(self.settings, "backfill_block_startup", False):
+            return
+
+        timeout_ms = getattr(self.settings, "backfill_block_startup_timeout_ms", 300_000)
+        timeout_sec = timeout_ms / 1000 if timeout_ms > 0 else None
+
+        try:
+            await asyncio.wait_for(asyncio.shield(self._backfill_task), timeout=timeout_sec)
+        except asyncio.TimeoutError:
+            self.logger.warning(
+                "backfill_blocking_timeout_exceeded",
+                timeout_ms=timeout_ms,
+                note="unblocking startup; backfill continues in background",
+            )
+        except Exception as e:
+            self.logger.warning("backfill_failed", error=str(e))
+
     async def _prime_cache_from_storage(self) -> None:
         """Prime in-memory values from persisted aggregates.
 
@@ -331,92 +412,15 @@ class CryptoOrderflowServer:
         # IMPORTANT:
         # - Backfill can be heavy and may hit Binance REST rate limits.
         # - If BACKFILL_BLOCK_STARTUP=true, FastAPI will remain in
-        #   "Waiting for application startup" until backfill completes.
+        #   "Waiting for application startup" until backfill completes (or the timeout elapses).
         #   For remote CherryStudio usage you usually want this FALSE.
-        async def _startup_backfill() -> None:
-            if not self.settings.backfill_enabled:
-                return
-            block_start_ms = timestamp_ms()
-            max_block_ms = getattr(self.settings, "backfill_block_startup_timeout_ms", 300_000)
-
-            start_ms, end_ms = get_required_backfill_range()
-            backfiller = AggTradesBackfiller(self.rest_client, self.storage)
-            clear_days = bool(getattr(self.settings, "backfill_rebuild", False))
-
-            try:
-                for symbol in self.settings.symbol_list:
-                    if max_block_ms > 0 and (timestamp_ms() - block_start_ms) > max_block_ms:
-                        self.logger.warning(
-                            "backfill_blocking_timeout_exceeded",
-                            timeout_ms=max_block_ms,
-                            note="Startup backfill stopped early; server will continue boot.",
-                        )
-                        break
-                    try:
-                        self.logger.info(
-                            "backfill_symbol_start",
-                            symbol=symbol,
-                            start_ms=start_ms,
-                            end_ms=end_ms,
-                            rebuild=clear_days,
-                        )
-                        result = await backfiller.backfill_symbol_range(
-                            symbol=symbol,
-                            start_time=start_ms,
-                            end_time=end_ms,
-                            max_requests=(
-                                self.settings.backfill_max_requests_per_symbol
-                                if self.settings.backfill_max_requests_per_symbol > 0
-                                else None
-                            ),
-                            pause_ms=self.settings.backfill_request_pause_ms,
-                            clear_days=clear_days,
-                        )
-
-                        # Prime day CVD so snapshot numbers are meaningful.
-                        day_start = get_day_start_ms(end_ms)
-                        if result.cvd_end_day is not None:
-                            self.cache.set_cvd(symbol, float(result.cvd_end_day), reset_time=day_start)
-                        else:
-                            try:
-                                cvd = await self.storage.get_day_cvd(symbol, day_start)
-                                if cvd is not None:
-                                    self.cache.set_cvd(symbol, float(cvd), reset_time=day_start)
-                            except Exception:
-                                pass
-
-                        self.logger.info("backfill_done", **result.__dict__)
-
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as e:
-                        # Do NOT fail the whole server if one symbol backfill fails.
-                        self.logger.warning("backfill_symbol_failed", symbol=symbol, error=str(e))
-                    if max_block_ms > 0 and (timestamp_ms() - block_start_ms) > max_block_ms:
-                        self.logger.warning(
-                            "backfill_blocking_timeout_exceeded",
-                            timeout_ms=max_block_ms,
-                            note="Startup backfill stopped early; server will continue boot.",
-                        )
-                        break
-            finally:
-                try:
-                    await backfiller.close()
-                except Exception:
-                    pass
-
         if self.settings.backfill_enabled:
             if getattr(self.settings, "backfill_block_startup", False):
-                try:
-                    self.logger.warning(
-                        "backfill_blocking_startup",
-                        note="Set BACKFILL_BLOCK_STARTUP=false if you need the MCP server reachable immediately",
-                    )
-                    await _startup_backfill()
-                except Exception as e:
-                    self.logger.warning("backfill_failed", error=str(e))
-            else:
-                self._backfill_task = asyncio.create_task(_startup_backfill())
+                self.logger.warning(
+                    "backfill_blocking_startup",
+                    note="Set BACKFILL_BLOCK_STARTUP=false if you need the MCP server reachable immediately",
+                )
+            await self._launch_backfill()
         
         # ------------------------------------------------------------------
         # Orderbook initialization
