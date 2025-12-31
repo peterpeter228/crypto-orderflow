@@ -118,3 +118,67 @@ async def test_heatmap_disabled_remediation():
     out = await tools.get_orderbook_heatmap("BTCUSDT")
     assert out["enabled"] is False
     assert "remediation" in out
+
+
+class KeywordOnlyFootprint:
+    def __init__(self) -> None:
+        self.called_with = None
+
+    async def get_footprint_range(self, *, symbol: str, timeframe: str, start_time: int, end_time: int):
+        self.called_with = (symbol, timeframe, start_time, end_time)
+        return []
+
+
+class KeywordOnlyBackfill:
+    def __init__(self) -> None:
+        self.called = False
+        self.args = None
+
+    async def __call__(self, symbol: str, start_ms: int, end_ms: int, *, coverage_pct: float):
+        self.called = True
+        self.args = (symbol, start_ms, end_ms, coverage_pct)
+
+
+@pytest.mark.anyio
+async def test_get_footprint_levels_respects_keyword_params():
+    storage = MagicMock()
+    storage.get_footprint_coverage = AsyncMock(return_value={"minute_buckets": 10, "min_ts": 0, "max_ts": 120_000})
+    footprint = KeywordOnlyFootprint()
+    tools = MCPTools(
+        cache=MemoryCache(),
+        storage=storage,
+        orderbook=MagicMock(),
+        rest_client=MagicMock(),
+        vwap=MagicMock(),
+        volume_profile=MagicMock(),
+        tpo_profile=MagicMock(),
+        session_levels=MagicMock(),
+        footprint=footprint,
+        delta_cvd=MagicMock(),
+        imbalance=MagicMock(),
+        depth_delta=MagicMock(),
+        heatmap=None,
+    )
+
+    await tools.get_footprint(
+        "BTCUSDT",
+        start_time=0,
+        end_time=120_000,
+        timeframe="5m",
+        view="levels",
+    )
+
+    assert footprint.called_with == ("BTCUSDT", "5m", 0, 120_000)
+
+
+@pytest.mark.anyio
+async def test_profile_engine_backfill_callback_uses_keyword_coverage():
+    cache = MemoryCache()
+    storage = MagicMock()
+    backfill_cb = KeywordOnlyBackfill()
+    engine = VolumeProfileEngine(storage, cache, backfill_callback=backfill_cb, coverage_threshold=0.9)
+
+    await engine._maybe_backfill("BTCUSDT", 0, 60_000, 0.5)
+
+    assert backfill_cb.called is True
+    assert backfill_cb.args == ("BTCUSDT", 0, 60_000, 0.5)
