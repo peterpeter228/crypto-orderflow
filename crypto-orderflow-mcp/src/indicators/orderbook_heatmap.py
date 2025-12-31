@@ -19,7 +19,8 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from typing import DefaultDict
+from dataclasses import dataclass
+from typing import Any, DefaultDict, Mapping
 
 import structlog
 
@@ -27,6 +28,15 @@ from src.config import Settings
 from src.data.orderbook import OrderbookManager
 from src.data.storage import DataStorage
 from src.utils.helpers import timestamp_ms
+
+
+@dataclass
+class NormalizedOrderbookSnapshot:
+    mid_price: float
+    best_bid: float
+    best_ask: float
+    bids: dict[float, float]
+    asks: dict[float, float]
 
 
 class OrderbookHeatmapSampler:
@@ -53,6 +63,83 @@ class OrderbookHeatmapSampler:
         self.settings = settings
         self.logger = logger.bind(component="orderbook_heatmap")
         self._last_snapshot_ms: int = 0
+        self._missing_best_logged = False
+
+    def _normalize_snapshot(self, book: Any) -> NormalizedOrderbookSnapshot | None:
+        """Normalize orderbook snapshots (dict or object) to a common shape."""
+        if not book:
+            return None
+
+        mid_price: float | None = None
+        best_bid: float | None = None
+        best_ask: float | None = None
+        bids_raw: Any = None
+        asks_raw: Any = None
+
+        if isinstance(book, Mapping):
+            mid_price = book.get("mid_price") or book.get("midPrice")
+            best_bid = book.get("best_bid") or book.get("bestBid")
+            best_ask = book.get("best_ask") or book.get("bestAsk")
+            bids_raw = book.get("bids")
+            asks_raw = book.get("asks")
+        else:
+            mid_price = getattr(book, "mid_price", None)
+            best_bid = getattr(book, "best_bid", None)
+            best_ask = getattr(book, "best_ask", None)
+            bids_raw = getattr(book, "bids", None)
+            asks_raw = getattr(book, "asks", None)
+
+        def _convert_side(side: Any) -> dict[float, float]:
+            # Accept dict-like {price: qty} or list of {"price": x, "quantity": y}
+            result: dict[float, float] = {}
+            if isinstance(side, Mapping):
+                for price, qty in side.items():
+                    try:
+                        result[float(price)] = float(qty)
+                    except Exception:
+                        continue
+            elif isinstance(side, (list, tuple)):
+                for row in side:
+                    try:
+                        price = float(row["price"]) if isinstance(row, Mapping) else float(row[0])
+                        qty = float(row["quantity"]) if isinstance(row, Mapping) else float(row[1])
+                        result[price] = qty
+                    except Exception:
+                        continue
+            return result
+
+        bids = _convert_side(bids_raw)
+        asks = _convert_side(asks_raw)
+
+        if best_bid is None and bids:
+            best_bid = max(bids.keys())
+        if best_ask is None and asks:
+            best_ask = min(asks.keys())
+
+        if mid_price is None and best_bid is not None and best_ask is not None:
+            mid_price = (float(best_bid) + float(best_ask)) / 2.0
+
+        if mid_price is None or best_bid is None or best_ask is None:
+            if not self._missing_best_logged:
+                self.logger.warning(
+                    "heatmap_missing_best_levels",
+                    has_mid=mid_price is not None,
+                    has_best_bid=best_bid is not None,
+                    has_best_ask=best_ask is not None,
+                )
+                self._missing_best_logged = True
+            return None
+
+        # Reset the one-shot warning once we eventually see valid data.
+        self._missing_best_logged = False
+
+        return NormalizedOrderbookSnapshot(
+            mid_price=float(mid_price),
+            best_bid=float(best_bid),
+            best_ask=float(best_ask),
+            bids=bids,
+            asks=asks,
+        )
 
     async def maybe_snapshot(self, symbol: str, now_ms: int | None = None) -> bool:
         """Take a snapshot if enough time has passed.
@@ -69,10 +156,11 @@ class OrderbookHeatmapSampler:
             return False
 
         book = self.orderbook.get_orderbook(symbol)
-        if not book or not book.mid_price:
+        normalized = self._normalize_snapshot(book)
+        if normalized is None:
             return False
 
-        mid = float(book.mid_price)
+        mid = normalized.mid_price
         pct = float(self.settings.heatmap_depth_percent)
         low = mid * (1.0 - pct / 100.0)
         high = mid * (1.0 + pct / 100.0)
@@ -85,13 +173,13 @@ class OrderbookHeatmapSampler:
         bins: DefaultDict[float, list[float]] = defaultdict(lambda: [0.0, 0.0])
 
         # Bids
-        for price, qty in book.bids.items():
+        for price, qty in normalized.bids.items():
             if low <= price <= high:
                 b = math.floor(price / bin_size) * bin_size
                 bins[b][0] += float(qty)
 
         # Asks
-        for price, qty in book.asks.items():
+        for price, qty in normalized.asks.items():
             if low <= price <= high:
                 b = math.floor(price / bin_size) * bin_size
                 bins[b][1] += float(qty)
