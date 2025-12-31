@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from typing import Any
@@ -17,6 +18,7 @@ from src.indicators import (
     VWAPCalculator,
     VolumeProfileCalculator,
     VolumeProfileEngine,
+    ValueAreaCalculator,
     SessionLevelsCalculator,
     FootprintCalculator,
     DeltaCVDCalculator,
@@ -27,6 +29,135 @@ from src.indicators import (
 )
 from src.utils import get_logger, timestamp_ms
 from src.utils.helpers import get_day_start_ms, get_timeframe_ms
+
+
+def build_quote_profile(
+    rows: list[dict[str, Any]] | list[Any],
+    bin_size: float,
+    *,
+    value_area_percent: float = 70.0,
+    normalize_seconds: int = 3,
+    mode: str = "raw",
+) -> dict[str, Any]:
+    """Aggregate quote notional into price bins and compute key levels.
+
+    Args:
+        rows: Footprint-style rows (preferred) or kline-derived rows. Expected keys include
+            price_level/price/close, buy_volume & sell_volume (base) or buy_quote/sell_quote,
+            optional quote_volume + taker_buy_quote_volume for kline fallback.
+        bin_size: Price bucket size.
+        value_area_percent: Value area percentage (e.g., 70 for 70%).
+        normalize_seconds: Synthetic mode scaler (aligned with VolumeProfileEngine).
+        mode: "raw" or "synthetic"; synthetic scales totals by normalize_seconds/60.
+
+    Returns:
+        Dict with histogram, vPOC/VAH/VAL, totals, delta, and quality flags.
+    """
+
+    def _get(row: dict[str, Any] | Any, key: str) -> Any:
+        if isinstance(row, dict):
+            return row.get(key)
+        return getattr(row, key, None)
+
+    if bin_size is None or bin_size <= 0:
+        raise ValueError("bin_size must be positive for quote profile aggregation")
+
+    histogram: dict[float, float] = {}
+    buy_total = 0.0
+    sell_total = 0.0
+    base_total = 0.0
+    trade_count = 0
+
+    for row in rows or []:
+        price = None
+        for key in ("price_level", "price", "close", "open"):
+            val = _get(row, key)
+            if val is not None:
+                price = float(val)
+                break
+        if price is None:
+            continue
+
+        buy_quote = None
+        sell_quote = None
+
+        buy_base = _get(row, "buy_volume") or _get(row, "buyVolume") or _get(row, "buy_qty") or _get(row, "buyQty")
+        sell_base = _get(row, "sell_volume") or _get(row, "sellVolume") or _get(row, "sell_qty") or _get(row, "sellQty")
+
+        for key in ("buy_quote", "buyNotional", "buy_notional"):
+            val = _get(row, key)
+            if val is not None:
+                buy_quote = float(val)
+                break
+
+        for key in ("sell_quote", "sellNotional", "sell_notional"):
+            val = _get(row, key)
+            if val is not None:
+                sell_quote = float(val)
+                break
+
+        if buy_quote is None and buy_base is not None:
+            buy_quote = float(buy_base) * price
+        if sell_quote is None and sell_base is not None:
+            sell_quote = float(sell_base) * price
+
+        quote_volume = _get(row, "quote_volume") or _get(row, "quoteVolume") or _get(row, "volumeQuote") or _get(row, "volume_quote")
+        taker_buy_quote = _get(row, "taker_buy_quote_volume") or _get(row, "takerBuyQuoteVolume")
+        if buy_quote is None and quote_volume is not None:
+            buy_quote = float(taker_buy_quote or 0.0)
+        if sell_quote is None and quote_volume is not None:
+            sell_quote = max(0.0, float(quote_volume) - float(buy_quote or 0.0))
+
+        bq = float(buy_quote or 0.0)
+        sq = float(sell_quote or 0.0)
+        if bq <= 0 and sq <= 0:
+            continue
+
+        base_total += float(buy_base or 0.0) + float(sell_base or 0.0)
+        buy_total += bq
+        sell_total += sq
+
+        binned = math.floor(price / bin_size) * bin_size
+        histogram[binned] = histogram.get(binned, 0.0) + bq + sq
+
+        trade_count += int(_get(row, "trade_count") or _get(row, "tradeCount") or 0)
+
+    if mode == "synthetic":
+        factor = max(0.01, float(normalize_seconds) / 60.0)
+        histogram = {p: v * factor for p, v in histogram.items()}
+
+    v_poc = v_vah = v_val = None
+    quality_flags: list[str] = []
+    if histogram:
+        v_poc, v_vah, v_val = ValueAreaCalculator.compute(histogram, value_area_percent)
+    else:
+        quality_flags.append("insufficient_data")
+
+    total_quote = float(sum(histogram.values())) if histogram else 0.0
+    delta_quote = float(buy_total - sell_total)
+    high = max(histogram.keys()) if histogram else None
+    low = min(histogram.keys()) if histogram else None
+
+    return {
+        "success": True,
+        "quality_flags": quality_flags,
+        "histogram": histogram,
+        "vPOC": v_poc,
+        "vVAH": v_vah,
+        "vVAL": v_val,
+        "volumeQuote": total_quote,
+        "buyQuote": float(buy_total),
+        "sellQuote": float(sell_total),
+        "deltaQuote": delta_quote,
+        "tradeCount": int(trade_count),
+        "binCount": len(histogram),
+        "high": high,
+        "low": low,
+        "baseVolume": float(base_total),
+        "mode": mode,
+        "valueAreaPercent": float(value_area_percent),
+        "degraded": bool(quality_flags),
+    }
 
 
 class MCPTools:
@@ -784,16 +915,45 @@ class MCPTools:
 
                 profile_levels = profile_result.get("levels") if include_profile_levels else None
                 dq = profile_result.get("dataQuality") or {}
-                profile_available = (profile_result.get("totals") or {}).get("totalVolume", 0) > 0
 
-                v_poc = (profile_result.get("valueArea") or {}).get("vPOC")
-                v_vah = (profile_result.get("valueArea") or {}).get("VAH")
-                v_val = (profile_result.get("valueArea") or {}).get("VAL")
+                # -----------------------------
+                # Quote-based profile (footprint preferred, klines fallback)
+                # -----------------------------
+                fp_rows = await self.storage.get_profile_range(symbol, start_ms, effective_end)
+                quote_rows = fp_rows
+                quote_rows_source = "footprint_1m"
+                if not quote_rows and klines:
+                    quote_rows = [
+                        {
+                            "price": float(k.close if k.close is not None else k.high),
+                            "quote_volume": float(k.quote_volume),
+                            "taker_buy_quote_volume": float(k.taker_buy_quote_volume),
+                            "trade_count": int(getattr(k, "trade_count", 0) or 0),
+                        }
+                        for k in klines
+                    ]
+                    quote_rows_source = "binance_klines"
 
-                vol_quote = (profile_result.get("totals") or {}).get("totalVolume") or k_quote
-                delta_quote = k_delta  # delta at profile granularity is not retained in compressed output
+                quote_profile = build_quote_profile(
+                    quote_rows,
+                    bin_size=bin_sz,
+                    value_area_percent=value_area_percent,
+                    normalize_seconds=normalize_seconds,
+                    mode=mode,
+                )
+
+                quality_flags = list(quote_profile.get("quality_flags") or [])
+                dq_degraded = dq.get("coveragePct", 0) < self.coverage_threshold and not dq.get("dayIncomplete")
+                if dq_degraded and "low_coverage" not in quality_flags:
+                    quality_flags.append("low_coverage")
+
+                vol_quote = quote_profile.get("volumeQuote") or k_quote
+                buy_quote = quote_profile.get("buyQuote") or 0.0
+                sell_quote = quote_profile.get("sellQuote") or 0.0
+                delta_quote = quote_profile.get("deltaQuote", k_delta)
+                profile_available = bool(quote_profile.get("histogram"))
                 vwap = (vol_quote / k_base) if profile_available and k_base > 0 else k_vwap
-                totals_source = "footprint_1m" if profile_available else "binance_klines"
+                totals_source = quote_rows_source if profile_available else "binance_klines"
 
                 out[name] = {
                     "name": name,
@@ -818,18 +978,20 @@ class MCPTools:
                         "mode": "quote_usdt",
                         "available": profile_available,
                         "valueAreaPercent": float(value_area_percent),
-                        "vPOC": v_poc,
-                        "vVAH": v_vah,
-                        "vVAL": v_val,
-                        "high": max(quote_profile.keys()) if quote_profile else None,
-                        "low": min(quote_profile.keys()) if quote_profile else None,
-                        "volumeQuote": fp_quote,
+                        "vPOC": quote_profile.get("vPOC"),
+                        "vVAH": quote_profile.get("vVAH"),
+                        "vVAL": quote_profile.get("vVAL"),
+                        "high": quote_profile.get("high"),
+                        "low": quote_profile.get("low"),
+                        "volumeQuote": quote_profile.get("volumeQuote"),
                         "buyQuote": buy_quote,
                         "sellQuote": sell_quote,
-                        "deltaQuote": fp_delta,
-                        "tradeCount": trade_count,
+                        "deltaQuote": delta_quote,
+                        "tradeCount": quote_profile.get("tradeCount"),
                         "levels": profile_levels,
-                        "degraded": dq["degraded"],
+                        "degraded": bool(quality_flags),
+                        "qualityFlags": quality_flags,
+                        "binSize": bin_sz,
                     },
                     "extra": {"acr": acr, "rf": rf, "klineVWAP": k_vwap},
                     "dataQuality": dq,
