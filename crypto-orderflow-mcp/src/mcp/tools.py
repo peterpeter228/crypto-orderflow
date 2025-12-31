@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import Any
 
 from src.config import get_settings
@@ -239,6 +240,45 @@ class MCPTools:
             reason="missing_helper",
         )
         return default_value
+
+    @staticmethod
+    def _get_day_start_ms_in_tz(timestamp_ms: int, tzinfo: ZoneInfo) -> int:
+        dt = datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc).astimezone(tzinfo)
+        day_start = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        return int(day_start.timestamp() * 1000)
+
+    def parse_date_or_today(
+        self,
+        date_str: str | None,
+        session_tz: str = "UTC",
+        *,
+        now_ms: int | None = None,
+    ) -> tuple[int, bool]:
+        """Parse a YYYY-MM-DD date string or fall back to the current day.
+
+        Returns a tuple of (day_start_ms, is_current_day).
+        """
+
+        tz_name = session_tz or "UTC"
+        try:
+            tzinfo = ZoneInfo(tz_name)
+        except Exception as exc:
+            raise ValueError(f"Invalid session timezone: {tz_name}") from exc
+
+        now_ms = now_ms or timestamp_ms()
+        today_start_ms = self._get_day_start_ms_in_tz(now_ms, tzinfo)
+
+        if date_str is None or str(date_str).strip() == "":
+            return today_start_ms, True
+
+        try:
+            parsed = datetime.strptime(str(date_str).strip(), "%Y-%m-%d").replace(tzinfo=tzinfo)
+        except ValueError as exc:
+            raise ValueError("date must be YYYY-MM-DD") from exc
+
+        day_start_ms = parsed.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000
+        day_start_ms = int(day_start_ms)
+        return day_start_ms, day_start_ms == today_start_ms
     
     async def get_market_snapshot(self, symbol: str) -> dict[str, Any]:
         """Get market snapshot including price, funding, OI.
@@ -321,29 +361,37 @@ class MCPTools:
         symbol = symbol.upper()
         now = timestamp_ms()
 
-        # Optional date anchor (UTC)
-        ref_day_start: int | None = None
-        if date:
-            try:
-                d = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                ref_day_start = int(d.timestamp() * 1000)
-            except Exception:
-                ref_day_start = None
+        try:
+            day_start_ms, is_current_day = self.parse_date_or_today(date, session_tz, now_ms=now)
+        except ValueError as exc:
+            return {
+                "success": False,
+                "error": {
+                    "message": str(exc),
+                    "code": "invalid_date",
+                    "input": date,
+                },
+            }
+
+        quality_flags: list[str] = []
+        day_end_ms = day_start_ms + 86_400_000 - 1
+        dev_window_end_ms = now if is_current_day else day_end_ms
+        if dev_window_end_ms < day_end_ms:
+            quality_flags.append("using_partial_session_data")
 
         # Get VWAP levels
-        vwap_levels = await self.vwap.get_key_levels(symbol, date=ref_day_start)
+        vwap_levels = await self.vwap.get_key_levels(symbol, date=day_start_ms)
 
         # Volume Profile (aligned with profile engine / Exocharts binning)
         bin_sz = float(bin_size or self.settings.get_tpo_tick_size(symbol))
         va_pct = float(value_area_pct)
-        day_start_ms = ref_day_start or get_day_start_ms(now)
-        day_end_ms = day_start_ms + 86_400_000
         prev_day_start = day_start_ms - 86_400_000
+        prev_day_end_ms = day_start_ms - 1
 
         dev_profile = await self.profile_engine.build_profile(
             symbol,
             window_start_ms=day_start_ms,
-            window_end_ms=day_end_ms if is_current_day else day_end_ms,
+            window_end_ms=dev_window_end_ms,
             bin_size=bin_sz,
             value_area_pct=va_pct,
             mode=mode,
@@ -353,7 +401,7 @@ class MCPTools:
         prev_profile = await self.profile_engine.build_profile(
             symbol,
             window_start_ms=prev_day_start,
-            window_end_ms=day_start_ms,
+            window_end_ms=prev_day_end_ms,
             bin_size=bin_sz,
             value_area_pct=va_pct,
             mode=mode,
@@ -384,7 +432,7 @@ class MCPTools:
         # Get Session levels
         # NOTE: SessionLevelsCalculator.get_key_levels() accepts `date` (ms day_start), not `date_ms`.
         # `session_tz` is informational for now; sessions are tracked in UTC.
-        session_levels = await self.session_levels.get_key_levels(symbol, date=ref_day_start)
+        session_levels = await self.session_levels.get_key_levels(symbol, date=day_start_ms)
 
         # Flatten the most commonly used labels (matches many charting packages)
         developing = (vp_levels or {}).get("developing", {})
@@ -472,6 +520,7 @@ class MCPTools:
             },
             "sessionWindows": session_windows,
             "sessionTZ": session_tz or "UTC",
+            "qualityFlags": quality_flags,
             "profileParams": {
                 "binSize": bin_sz,
                 "valueAreaPct": float(va_pct if va_pct <= 1 else va_pct / 100.0),
